@@ -204,17 +204,11 @@ pub fn scan(
     index
 }
 
-fn scan_root(
-    index: &mut Index,
-    root: &Path,
-    exclusions: &[String],
-    progress: &AtomicUsize,
-    cancel: &AtomicBool,
-) {
-    use jwalk::WalkDirGeneric;
+type Walker = jwalk::WalkDirGeneric<((), Option<std::fs::Metadata>)>;
 
+fn make_walker(root: &Path, exclusions: &[String]) -> Walker {
     let matcher = std::sync::Arc::new(crate::util::ExclusionMatcher::new(exclusions));
-    let walker = WalkDirGeneric::<((), Option<std::fs::Metadata>)>::new(root)
+    Walker::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_depth, _path, _state, children| {
@@ -225,9 +219,121 @@ fn scan_root(
             for child in children.iter_mut().flatten() {
                 child.client_state = child.metadata().ok();
             }
-        });
+        })
+}
 
-    for entry in walker {
+/// First-run scan: streams entries into the shared `live` index in batches so
+/// the app is searchable immediately, with results growing as the scan runs.
+/// Only call when starting from scratch — it replaces whatever is in `live`.
+pub fn scan_into(
+    live: &std::sync::RwLock<Index>,
+    roots: &[PathBuf],
+    exclusions: &[String],
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+    dirty: &AtomicBool,
+) {
+    const BATCH: usize = 65_536;
+    {
+        let mut guard = live.write().unwrap();
+        *guard = Index {
+            roots: roots.to_vec(),
+            scanned_at: system_time_secs(Some(SystemTime::now())),
+            ..Default::default()
+        };
+    }
+    progress.store(0, Ordering::Relaxed);
+
+    // Local mirrors let the walk assign final indices without holding the lock.
+    let mut dir_map_local: HashMap<PathBuf, u32> = HashMap::new();
+    let mut pending: Vec<Entry> = Vec::with_capacity(BATCH);
+    let mut pending_dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut base: u32 = 0;
+
+    for root in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        for entry in make_walker(root, exclusions) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            let is_dir = entry.file_type().is_dir();
+            let (size, modified) = match &entry.client_state {
+                Some(meta) => (
+                    if is_dir { 0 } else { meta.len() },
+                    system_time_secs(meta.modified().ok()),
+                ),
+                None => (0, 0),
+            };
+            let parent_idx = if entry.depth() == 0 {
+                NO_PARENT
+            } else {
+                match dir_map_local.get(entry.parent_path()) {
+                    Some(&i) => i,
+                    None => continue,
+                }
+            };
+            let name = if entry.depth() == 0 {
+                path.to_string_lossy().into_owned()
+            } else {
+                entry.file_name().to_string_lossy().into_owned()
+            };
+
+            let idx = base + pending.len() as u32;
+            pending.push(Entry {
+                name: name.into(),
+                parent: parent_idx,
+                size,
+                modified,
+                flags: if is_dir { FLAG_DIR } else { 0 },
+            });
+            if is_dir {
+                dir_map_local.insert(path.clone(), idx);
+                pending_dirs.push((path, idx));
+            }
+            progress.fetch_add(1, Ordering::Relaxed);
+            if pending.len() >= BATCH {
+                flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+            }
+        }
+    }
+    flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+}
+
+fn flush_batch(
+    live: &std::sync::RwLock<Index>,
+    pending: &mut Vec<Entry>,
+    pending_dirs: &mut Vec<(PathBuf, u32)>,
+    base: &mut u32,
+    dirty: &AtomicBool,
+) {
+    if pending.is_empty() && pending_dirs.is_empty() {
+        return;
+    }
+    let mut guard = live.write().unwrap();
+    for entry in pending.drain(..) {
+        let idx = guard.entries.len() as u32;
+        if entry.parent != NO_PARENT {
+            guard.children.entry(entry.parent).or_default().push(idx);
+        }
+        guard.entries.push(entry);
+    }
+    guard.dir_map.extend(pending_dirs.drain(..));
+    *base = guard.entries.len() as u32;
+    dirty.store(true, Ordering::Relaxed);
+}
+
+fn scan_root(
+    index: &mut Index,
+    root: &Path,
+    exclusions: &[String],
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+) {
+    for entry in make_walker(root, exclusions) {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -332,6 +438,36 @@ mod tests {
             .unwrap();
         assert_eq!(hello.size, 11);
         assert!(!hello.is_dir());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_scan_into_live_index() {
+        let tmp = std::env::temp_dir().join(format!("find_test_live_{}", std::process::id()));
+        let sub = tmp.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.join("a.txt"), b"a").unwrap();
+        std::fs::write(sub.join("b.txt"), b"bb").unwrap();
+
+        let live = std::sync::RwLock::new(Index::default());
+        let progress = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        scan_into(&live, &[tmp.clone()], &[], &progress, &cancel, &dirty);
+
+        assert!(dirty.load(Ordering::Relaxed));
+        let guard = live.read().unwrap();
+        assert_eq!(guard.live_count(), 4); // root, a.txt, nested, b.txt
+        let b = guard
+            .entries
+            .iter()
+            .position(|e| e.name.as_ref() == "b.txt")
+            .unwrap() as u32;
+        assert_eq!(guard.full_path(b), sub.join("b.txt"));
+        // dir_map was published, so the watcher could resolve parents.
+        assert!(guard.dir_map.contains_key(&sub));
+        drop(guard);
 
         std::fs::remove_dir_all(&tmp).ok();
     }

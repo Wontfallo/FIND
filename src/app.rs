@@ -82,9 +82,35 @@ pub struct FindApp {
     tray: Option<crate::tray::Tray>,
 }
 
+/// Brand palette (matches the logo: deep navy, electric blue, violet).
+mod palette {
+    use eframe::egui::Color32;
+    pub const BG: Color32 = Color32::from_rgb(13, 17, 32);
+    pub const BAR: Color32 = Color32::from_rgb(24, 33, 66);
+    pub const BAR_EDGE: Color32 = Color32::from_rgb(59, 130, 246);
+    pub const INPUT_BG: Color32 = Color32::from_rgb(8, 11, 24);
+    pub const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
+    pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(125, 200, 255);
+}
+
+fn brand_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = palette::BG;
+    v.window_fill = palette::BG;
+    v.extreme_bg_color = palette::INPUT_BG;
+    v.faint_bg_color = egui::Color32::from_rgb(19, 25, 47); // table stripes
+    v.selection.bg_fill = palette::ACCENT;
+    v.selection.stroke = egui::Stroke::new(1.0, palette::ACCENT_LIGHT);
+    v.hyperlink_color = palette::ACCENT_LIGHT;
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(31, 45, 90);
+    v.widgets.active.bg_fill = palette::ACCENT;
+    v
+}
+
 impl FindApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        cc.egui_ctx.set_visuals(brand_visuals());
 
         let settings = Settings::load();
         let index = Arc::new(RwLock::new(Index::default()));
@@ -408,25 +434,43 @@ fn spawn_initial_load(
     std::thread::Builder::new()
         .name("find-init".into())
         .spawn(move || {
-            if let Some(loaded) = index::load_from_disk() {
-                if loaded.roots == settings.roots {
+            let cached = index::load_from_disk().filter(|l| l.roots == settings.roots);
+            if scanning.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            match cached {
+                Some(loaded) => {
+                    // Instant startup from the saved index, then a background
+                    // rescan that swaps in atomically when complete.
                     *index.write().unwrap() = loaded;
                     dirty.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
+                    let new_index =
+                        index::scan(&settings.roots, &settings.exclusions, &progress, &cancel);
+                    if !cancel.load(Ordering::Relaxed) {
+                        let _ = index::save_to_disk(&new_index);
+                        *index.write().unwrap() = new_index;
+                    }
+                }
+                None => {
+                    // First run: stream the scan into the live index so search
+                    // works immediately, with results filling in as it goes.
+                    index::scan_into(
+                        &index,
+                        &settings.roots,
+                        &settings.exclusions,
+                        &progress,
+                        &cancel,
+                        &dirty,
+                    );
+                    if !cancel.load(Ordering::Relaxed) {
+                        let _ = index::save_to_disk(&index.read().unwrap());
+                    }
                 }
             }
-            // Always rescan to pick up changes made while we weren't running.
-            if !scanning.swap(true, Ordering::SeqCst) {
-                let new_index =
-                    index::scan(&settings.roots, &settings.exclusions, &progress, &cancel);
-                if !cancel.load(Ordering::Relaxed) {
-                    let _ = index::save_to_disk(&new_index);
-                    *index.write().unwrap() = new_index;
-                }
-                scanning.store(false, Ordering::SeqCst);
-                dirty.store(true, Ordering::Relaxed);
-                ctx.request_repaint();
-            }
+            scanning.store(false, Ordering::SeqCst);
+            dirty.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
         })
         .ok();
 }
@@ -521,7 +565,13 @@ impl FindApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        // Distinct brand-navy bar with a blue accent line, so the app's
+        // toolbar reads clearly against the OS title bar above it.
+        let frame = egui::Frame::default()
+            .fill(palette::BAR)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .stroke(egui::Stroke::new(1.0, palette::BAR_EDGE));
+        egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let search = ui.add(
@@ -595,7 +645,10 @@ impl FindApp {
     }
 
     fn status_bar(&mut self, ctx: &egui::Context, scanning: bool) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let frame = egui::Frame::default()
+            .fill(palette::BAR)
+            .inner_margin(egui::Margin::symmetric(8, 4));
+        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} objects indexed", thousands(self.index_count)));
                 ui.separator();
