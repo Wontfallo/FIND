@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-transparent.png" width="280" alt="FIND logo">
+</p>
+
 # FIND — instant file search for your PC
 
 FIND is a fast, native desktop search tool in the spirit of

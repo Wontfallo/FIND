@@ -128,11 +128,24 @@ fn render() -> RgbaImage {
 }
 
 fn main() {
-    let base = render();
     std::fs::create_dir_all("assets").unwrap();
 
-    let dynamic = DynamicImage::ImageRgba8(base);
-    dynamic.save("assets/icon-256.png").unwrap();
+    // Prefer the real brand art (committed as assets/app-icon-1024.png);
+    // fall back to the code-drawn icon if it isn't there.
+    let dynamic = match image::open("assets/app-icon-1024.png") {
+        Ok(img) => {
+            println!("using brand icon assets/app-icon-1024.png");
+            img
+        }
+        Err(_) => {
+            println!("brand icon not found; using generated placeholder");
+            DynamicImage::ImageRgba8(render())
+        }
+    };
+    dynamic
+        .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+        .save("assets/icon-256.png")
+        .unwrap();
 
     let sizes = [16u32, 24, 32, 48, 64, 128, 256];
     let frames: Vec<RgbaImage> = sizes
@@ -152,29 +165,41 @@ fn main() {
     let file = std::fs::File::create("assets/icon.ico").unwrap();
     IcoEncoder::new(file).encode_images(&ico_frames).unwrap();
 
-    // Placeholder splash (swapped for real brand art when available): the
-    // icon centered on a dark gradient, 1280x720.
-    let (sw, sh) = (1280u32, 720u32);
-    let mut splash = RgbaImage::new(sw, sh);
-    for y in 0..sh {
-        let t = y as f32 / sh as f32;
-        let r = (10.0 + 14.0 * t) as u8;
-        let g = (12.0 + 10.0 * t) as u8;
-        let b = (34.0 + 26.0 * t) as u8;
-        for x in 0..sw {
-            splash.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+    // Splash: prefer the real brand banner, resized to keep the embedded
+    // binary small; otherwise compose a placeholder from the icon.
+    match image::open("assets/splash-screen.png") {
+        Ok(banner) => {
+            println!("using brand splash assets/splash-screen.png");
+            banner
+                .resize(1280, 1280, image::imageops::FilterType::Lanczos3)
+                .save("assets/splash.png")
+                .unwrap();
+        }
+        Err(_) => {
+            println!("brand splash not found; generating placeholder");
+            let (sw, sh) = (1280u32, 720u32);
+            let mut splash = RgbaImage::new(sw, sh);
+            for y in 0..sh {
+                let t = y as f32 / sh as f32;
+                let r = (10.0 + 14.0 * t) as u8;
+                let g = (12.0 + 10.0 * t) as u8;
+                let b = (34.0 + 26.0 * t) as u8;
+                for x in 0..sw {
+                    splash.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+                }
+            }
+            let badge = dynamic.resize_exact(320, 320, image::imageops::FilterType::Lanczos3);
+            image::imageops::overlay(
+                &mut splash,
+                &badge,
+                (sw as i64 - 320) / 2,
+                (sh as i64 - 320) / 2,
+            );
+            DynamicImage::ImageRgba8(splash)
+                .save("assets/splash.png")
+                .unwrap();
         }
     }
-    let badge = dynamic.resize_exact(320, 320, image::imageops::FilterType::Lanczos3);
-    image::imageops::overlay(
-        &mut splash,
-        &badge,
-        (sw as i64 - 320) / 2,
-        (sh as i64 - 320) / 2,
-    );
-    DynamicImage::ImageRgba8(splash)
-        .save("assets/splash.png")
-        .unwrap();
 
     println!("wrote assets/icon-256.png, assets/icon.ico, and assets/splash.png");
 }
