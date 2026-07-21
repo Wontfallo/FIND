@@ -31,8 +31,16 @@ grep-regex = "0.1"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossbeam-channel = "0.5"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12.0"
 
 [profile.release]
 lto = "thin"
 strip = true
 opt-level = 3
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.24.1"
