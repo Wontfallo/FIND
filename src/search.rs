@@ -259,7 +259,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn test_index() -> (Index, PathBuf) {
-        let tmp = std::env::temp_dir().join(format!("find_search_test_{}", std::process::id()));
+        // Unique per call: these tests run in parallel in one process, so a
+        // pid-keyed directory would be shared and torn down under each other.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!(
+            "find_search_test_{}_{n}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(tmp.join("docs")).unwrap();
         std::fs::write(tmp.join("report_2024.pdf"), vec![0u8; 100]).unwrap();
         std::fs::write(tmp.join("notes.txt"), b"hello").unwrap();

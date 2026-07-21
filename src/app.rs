@@ -961,7 +961,8 @@ impl FindApp {
                      size:>10mb          also <, >=, <=, and 1mb..100mb\n\
                      date:>2024-01-01    modified after; also ranges a..b\n\
                      type:file           or type:folder\n\
-                     content:\"foo bar\"   grep inside text files\n\
+                     content:\"foo bar\"   search inside files — plain text,\n\
+                                         and PDF, DOCX, PPTX, XLSX, ODF too\n\
                      \n\
                      Modes (dropdown next to the search box):\n\
                      Substring  fast 'contains' matching (default)\n\

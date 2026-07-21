@@ -32,6 +32,11 @@ pub fn filter_by_content(
         .case_insensitive(!case_sensitive)
         .build(&pattern_src)
         .ok()?;
+    // Plain regex for searching text extracted from documents (PDF/Office).
+    let doc_regex = regex::RegexBuilder::new(&pattern_src)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .ok()?;
 
     let cancelled = || current.load(Ordering::Relaxed) != generation;
 
@@ -44,6 +49,22 @@ pub fn filter_by_content(
             if hit.is_dir || hit.size > MAX_GREP_SIZE {
                 return None;
             }
+
+            // Documents (PDF, DOCX, PPTX, XLSX, ODF): search extracted text.
+            if crate::doctext::is_document(&hit.name) {
+                let text = crate::doctext::extract_text(std::path::Path::new(&hit.path))?;
+                let found = text.lines().enumerate().find_map(|(i, line)| {
+                    doc_regex.is_match(line).then(|| {
+                        (i as u64 + 1, line.trim().chars().take(300).collect::<String>())
+                    })
+                });
+                return found.map(|line| Hit {
+                    content_line: Some(line),
+                    ..hit
+                });
+            }
+
+            // Everything else: grep the raw file (skips binaries).
             let mut searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .line_number(true)
@@ -103,6 +124,38 @@ mod tests {
         let (line_num, line) = out[0].content_line.clone().unwrap();
         assert_eq!(line_num, 2);
         assert!(line.contains("TODO"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_content_filter_inside_docx() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("find_grepdoc_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let docx = tmp.join("memo.docx");
+        let file = std::fs::File::create(&docx).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("word/document.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            br#"<w:document><w:p><w:r><w:t>The secret launch date is Friday.</w:t></w:r></w:p></w:document>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let size = std::fs::metadata(&docx).unwrap().len();
+
+        let hits = vec![hit_for(&docx, size)];
+        let gen = AtomicU64::new(2);
+        let out = filter_by_content(hits, "launch date", false, false, 2, &gen).unwrap();
+        assert_eq!(out.len(), 1);
+        let (_, line) = out[0].content_line.clone().unwrap();
+        assert!(line.contains("secret launch date"));
+
+        // A term that isn't present finds nothing.
+        let hits = vec![hit_for(&docx, size)];
+        let out = filter_by_content(hits, "absent-term", false, false, 2, &gen).unwrap();
+        assert!(out.is_empty());
 
         std::fs::remove_dir_all(&tmp).ok();
     }

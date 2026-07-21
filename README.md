@@ -19,7 +19,7 @@ executable written in Rust — no runtimes, no services, no installers.
   | `size:` | `size:>10mb`, `size:1mb..100mb` | file size |
   | `date:` | `date:>2024-01-01`, `date:2024-01..2024-06` | modified date |
   | `type:` | `type:folder`, `type:file` | folders or files only |
-  | `content:` | `content:"todo"` | **grep inside text files** |
+  | `content:` | `content:"todo"` | **search inside files** — plain text via the ripgrep engine, plus **PDF, DOCX, PPTX, XLSX, and OpenDocument** files via built-in text extraction |
 
 - **Category chips**: Documents, Images, Audio, Video, Archives, Code,
   Executables, Folders — one click to narrow results
@@ -82,6 +82,9 @@ cargo build --release
   generation-counter cancellation so stale keystrokes never block fresh ones.
 - `src/content.rs` — content grep with `grep-searcher` (ripgrep's engine),
   binary detection, and size caps.
+- `src/doctext.rs` — text extraction from PDF and Office/OpenDocument files
+  so `content:` can search inside them (ported from the author's
+  RipGrep-File-Finder app); also powers document previews.
 - `src/watcher.rs` — `notify`-based live updates, batched every 500 ms.
 - `src/app.rs` — egui UI; all search work happens on worker threads, the UI
   never blocks.

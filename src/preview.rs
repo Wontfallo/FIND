@@ -6,6 +6,7 @@ use std::io::Read;
 
 const TEXT_PREVIEW_BYTES: usize = 128 * 1024;
 const IMAGE_PREVIEW_MAX: u64 = 30 * 1024 * 1024;
+const DOC_PREVIEW_MAX: u64 = 8 * 1024 * 1024;
 
 pub enum PreviewContent {
     Empty,
@@ -26,6 +27,20 @@ pub fn load(hit: &Hit) -> PreviewContent {
         return PreviewContent::Image {
             uri: format!("file://{}", hit.path),
         };
+    }
+    // Documents (PDF, DOCX, PPTX, XLSX, ODF): preview their extracted text.
+    if find_core::doctext::is_document(&hit.name) && hit.size <= DOC_PREVIEW_MAX {
+        if let Some(mut text) = find_core::doctext::extract_text(std::path::Path::new(&hit.path)) {
+            let truncated = text.len() > TEXT_PREVIEW_BYTES;
+            if truncated {
+                let mut cut = TEXT_PREVIEW_BYTES;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            return PreviewContent::Text { text, truncated };
+        }
     }
     if is_texty(&hit.name) {
         match read_head(&hit.path) {
