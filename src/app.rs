@@ -707,6 +707,41 @@ impl FindApp {
     }
 
     fn results_panel(&mut self, ctx: &egui::Context) {
+        // Splash: shown until the first index (cached or fresh) is available.
+        if self.index_count == 0 && self.results.is_empty() && self.query.is_empty() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        let avail = ui.available_height();
+                        ui.add_space((avail * 0.18).max(0.0));
+                        ui.add(
+                            egui::Image::new(egui::ImageSource::Bytes {
+                                uri: "bytes://splash.png".into(),
+                                bytes: egui::load::Bytes::Static(include_bytes!(
+                                    "../assets/splash.png"
+                                )),
+                            })
+                            .max_height(avail * 0.55)
+                            .maintain_aspect_ratio(true),
+                        );
+                        ui.add_space(12.0);
+                        if self.scanning.load(Ordering::Relaxed) {
+                            ui.horizontal(|ui| {
+                                ui.add_space(ui.available_width() / 2.0 - 90.0);
+                                ui.spinner();
+                                ui.label(format!(
+                                    "Indexing your drives… {}",
+                                    thousands(self.scan_progress.load(Ordering::Relaxed))
+                                ));
+                            });
+                        } else {
+                            ui.label("Loading index…");
+                        }
+                    });
+                });
+            });
+            return;
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             use egui_extras::{Column, TableBuilder};
 

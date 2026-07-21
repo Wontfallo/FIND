@@ -152,5 +152,29 @@ fn main() {
     let file = std::fs::File::create("assets/icon.ico").unwrap();
     IcoEncoder::new(file).encode_images(&ico_frames).unwrap();
 
-    println!("wrote assets/icon-256.png and assets/icon.ico");
+    // Placeholder splash (swapped for real brand art when available): the
+    // icon centered on a dark gradient, 1280x720.
+    let (sw, sh) = (1280u32, 720u32);
+    let mut splash = RgbaImage::new(sw, sh);
+    for y in 0..sh {
+        let t = y as f32 / sh as f32;
+        let r = (10.0 + 14.0 * t) as u8;
+        let g = (12.0 + 10.0 * t) as u8;
+        let b = (34.0 + 26.0 * t) as u8;
+        for x in 0..sw {
+            splash.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+        }
+    }
+    let badge = dynamic.resize_exact(320, 320, image::imageops::FilterType::Lanczos3);
+    image::imageops::overlay(
+        &mut splash,
+        &badge,
+        (sw as i64 - 320) / 2,
+        (sh as i64 - 320) / 2,
+    );
+    DynamicImage::ImageRgba8(splash)
+        .save("assets/splash.png")
+        .unwrap();
+
+    println!("wrote assets/icon-256.png, assets/icon.ico, and assets/splash.png");
 }
