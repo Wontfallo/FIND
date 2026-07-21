@@ -98,3 +98,16 @@ cargo build --release
   `cargo run --example gen_icon` after tweaking it.
 
 License: MIT
+
+## Bonus: DOOM in your browser
+
+The [`doom/`](doom/) folder contains the original DOOM (1993 shareware
+episode) running entirely in the browser via WebAssembly. Serve it with any
+static file server and play:
+
+```sh
+python3 -m http.server 8000 --directory doom
+# open http://localhost:8000/
+```
+
+See [`doom/README.md`](doom/README.md) for controls and details.

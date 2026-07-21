@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DOOM</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='0' y='13' font-size='13'%3E%F0%9F%92%80%3C/text%3E%3C/svg%3E" />
+    <style>
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #0a0a0a;
+            color: #d4d4d4;
+            font-family: "Courier New", Courier, monospace;
+            min-height: 100%;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 16px;
+        }
+
+        h1 {
+            margin: 8px 0 2px;
+            font-size: 44px;
+            letter-spacing: 10px;
+            color: #ff2b1a;
+            text-shadow: 0 0 8px #ff2b1a, 0 0 28px #7a0000;
+            text-transform: uppercase;
+        }
+
+        .tagline {
+            margin: 0 0 14px;
+            color: #8a8a8a;
+            font-size: 13px;
+            letter-spacing: 2px;
+        }
+
+        #game {
+            position: relative;
+            width: min(960px, 100%);
+            background: #000;
+            border: 2px solid #3a3a3a;
+            box-shadow: 0 0 30px rgba(255, 43, 26, 0.15);
+        }
+
+        /* The canvas must not have any border or padding, or mouse coords will be wrong. */
+        #canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            background: #000;
+            outline: none;
+        }
+
+        #loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            background: #000;
+            z-index: 2;
+        }
+
+        #loading .skull { font-size: 40px; }
+
+        #status {
+            color: #ff2b1a;
+            font-size: 15px;
+            letter-spacing: 1px;
+        }
+
+        #bar {
+            width: 60%;
+            max-width: 380px;
+            height: 12px;
+            border: 1px solid #5a2020;
+            background: #1a0505;
+        }
+
+        #bar > div {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #7a0000, #ff2b1a);
+            transition: width 0.2s;
+        }
+
+        .toolbar {
+            width: min(960px, 100%);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 10px;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: #1a1a1a;
+            color: #ff2b1a;
+            border: 1px solid #5a2020;
+            font-family: inherit;
+            font-size: 14px;
+            letter-spacing: 1px;
+            padding: 8px 16px;
+            cursor: pointer;
+            text-transform: uppercase;
+        }
+
+        button:hover { background: #2a0a0a; box-shadow: 0 0 10px rgba(255, 43, 26, 0.4); }
+
+        .controls {
+            width: min(960px, 100%);
+            margin-top: 16px;
+            border-top: 1px solid #2a2a2a;
+            padding-top: 12px;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+
+        .controls h2 {
+            font-size: 15px;
+            color: #ff2b1a;
+            letter-spacing: 2px;
+            margin: 0 0 6px;
+            text-transform: uppercase;
+        }
+
+        kbd {
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-bottom-width: 2px;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-family: inherit;
+            color: #eee;
+        }
+
+        .footer {
+            margin-top: 18px;
+            font-size: 11px;
+            color: #666;
+            text-align: center;
+            line-height: 1.6;
+        }
+
+        .footer a { color: #996; }
+    </style>
+</head>
+<body>
+    <h1>Doom</h1>
+    <p class="tagline">SHAREWARE EPISODE 1 &mdash; KNEE-DEEP IN THE DEAD &mdash; RUNNING IN YOUR BROWSER VIA WEBASSEMBLY</p>
+
+    <div id="game">
+        <div id="loading">
+            <div class="skull">&#128128;</div>
+            <div id="status">LOADING...</div>
+            <div id="bar"><div id="barfill"></div></div>
+        </div>
+        <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+    </div>
+
+    <div class="toolbar">
+        <span id="hint">Click the game window to give it keyboard focus.</span>
+        <button id="fsbtn" type="button">Fullscreen</button>
+    </div>
+
+    <div class="controls">
+        <h2>Controls</h2>
+        <div>
+            <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> / arrow keys &mdash; move &nbsp;|&nbsp;
+            <kbd>Mouse</kbd> &mdash; aim &nbsp;|&nbsp;
+            <kbd>Space</kbd> / <kbd>Click</kbd> &mdash; fire &nbsp;|&nbsp;
+            <kbd>E</kbd> &mdash; open doors / use &nbsp;|&nbsp;
+            <kbd>Shift</kbd> &mdash; run
+        </div>
+        <div>
+            <kbd>1</kbd>&ndash;<kbd>7</kbd> &mdash; switch weapon &nbsp;|&nbsp;
+            <kbd>Tab</kbd> &mdash; automap &nbsp;|&nbsp;
+            <kbd>Enter</kbd> / <kbd>Esc</kbd> &mdash; menus
+        </div>
+    </div>
+
+    <p class="footer">
+        Chocolate Doom compiled to WebAssembly
+        (<a href="https://github.com/cloudflare/doom-wasm">cloudflare/doom-wasm</a>, GPL-2.0)
+        &middot; DOOM &copy; 1993 id Software &mdash; freely distributable shareware episode.
+    </p>
+
+    <script>
+        var statusEl = document.getElementById("status");
+        var loadingEl = document.getElementById("loading");
+        var barFill = document.getElementById("barfill");
+        var canvas = document.getElementById("canvas");
+
+        var commonArgs = ["-iwad", "doom1.wad", "-window", "-nogui", "-nomusic", "-config", "default.cfg"];
+
+        var Module = {
+            noInitialRun: true,
+            onRuntimeInitialized: function () {
+                callMain(commonArgs);
+                loadingEl.style.display = "none";
+                canvas.focus();
+            },
+            preRun: function () {
+                Module.FS.createPreloadedFile("", "doom1.wad", "doom1.wad", true, true);
+                Module.FS.createPreloadedFile("", "default.cfg", "default.cfg", true, true);
+            },
+            print: function (text) { console.log(text); },
+            printErr: function (text) {
+                if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(" ");
+                console.error(text);
+            },
+            canvas: (function () {
+                canvas.addEventListener("webglcontextlost", function (e) {
+                    alert("WebGL context lost. Reload the page to keep playing.");
+                    e.preventDefault();
+                }, false);
+                return canvas;
+            })(),
+            setStatus: function (text) { if (text) statusEl.textContent = text.toUpperCase(); },
+            totalDependencies: 0,
+            monitorRunDependencies: function (left) {
+                this.totalDependencies = Math.max(this.totalDependencies, left);
+                var done = this.totalDependencies - left;
+                if (this.totalDependencies > 0) {
+                    barFill.style.width = Math.round((done / this.totalDependencies) * 100) + "%";
+                }
+                Module.setStatus(left ? "Loading... (" + done + "/" + this.totalDependencies + ")" : "Ripping and tearing...");
+            },
+        };
+
+        window.onerror = function (message) {
+            statusEl.textContent = "ERROR - SEE BROWSER CONSOLE";
+            console.error(message);
+        };
+
+        // Browsers keep audio suspended until a user gesture; resume it on the
+        // first interaction so sound effects work.
+        function resumeAudio() {
+            if (typeof Module !== "undefined" && Module.SDL2 && Module.SDL2.audioContext &&
+                Module.SDL2.audioContext.state === "suspended") {
+                Module.SDL2.audioContext.resume();
+            }
+        }
+        document.addEventListener("click", resumeAudio);
+        document.addEventListener("keydown", resumeAudio);
+
+        document.getElementById("fsbtn").addEventListener("click", function () {
+            var game = document.getElementById("game");
+            if (game.requestFullscreen) game.requestFullscreen();
+            canvas.focus();
+        });
+    </script>
+    <script src="websockets-doom.js"></script>
+</body>
+</html>
