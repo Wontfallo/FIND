@@ -3,7 +3,6 @@
 //! parent pointer, so full paths are reconstructed on demand and memory stays
 //! small even with millions of files.
 
-use crate::util::is_excluded;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -214,13 +213,13 @@ fn scan_root(
 ) {
     use jwalk::WalkDirGeneric;
 
-    let exclusions = exclusions.to_vec();
+    let matcher = std::sync::Arc::new(crate::util::ExclusionMatcher::new(exclusions));
     let walker = WalkDirGeneric::<((), Option<std::fs::Metadata>)>::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_depth, _path, _state, children| {
             children.retain(|res| match res {
-                Ok(entry) => !is_excluded(&entry.path(), &exclusions),
+                Ok(entry) => !matcher.matches(&entry.path()),
                 Err(_) => false,
             });
             for child in children.iter_mut().flatten() {

@@ -31,6 +31,14 @@ executable written in Rust — no runtimes, no services, no installers.
 - **Live index**: a filesystem watcher keeps results current as files are
   created, renamed, or deleted; the index is also saved to disk so startup is
   instant, with a background refresh scan
+- **System tray** (Windows): closing the window keeps FIND running in the
+  tray, just like Everything — left-click the tray icon to bring it back,
+  right-click for Show / Rescan / Quit (toggleable in Settings)
+- **Noise-free by default**: `node_modules`, Python venvs, `__pycache__`,
+  `.git` internals, package caches, Windows system caches, and similar
+  dev/cache noise are excluded from indexing out of the box — fully editable
+  in Settings. Exclusions without a slash match whole folder names exactly
+  (`.git` won't hide `.github`); ones with slashes match path segments
 - **Case toggle**, configurable roots and exclusions, max-results cap
 
 ## Getting it
@@ -77,5 +85,9 @@ cargo build --release
 - `src/watcher.rs` — `notify`-based live updates, batched every 500 ms.
 - `src/app.rs` — egui UI; all search work happens on worker threads, the UI
   never blocks.
+- `src/tray.rs` — Windows system-tray integration (close-to-tray).
+- `examples/gen_icon.rs` — generates `assets/icon-256.png` and
+  `assets/icon.ico` (window, tray, and exe icons) entirely in code; run
+  `cargo run --example gen_icon` after tweaking it.
 
 License: MIT

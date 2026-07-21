@@ -255,36 +255,153 @@ pub fn default_roots() -> Vec<std::path::PathBuf> {
     }
 }
 
+/// Development/cache noise nobody wants cluttering their search results.
+/// A pattern without a path separator matches a whole path component exactly
+/// (case-insensitive); a pattern with separators is a substring match on the
+/// full path. All of these are editable in Settings.
 pub fn default_exclusions() -> Vec<String> {
+    let mut list: Vec<String> = [
+        // Version control internals
+        ".git", ".hg", ".svn",
+        // Node / JS
+        "node_modules", "bower_components", ".npm", ".yarn", ".pnpm-store",
+        ".next", ".nuxt", ".angular", ".parcel-cache", ".turbo",
+        // Python
+        ".venv", "venv", "virtualenv", "__pycache__", ".tox", ".nox",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".ipynb_checkpoints",
+        // Other build/dependency caches
+        ".gradle", ".m2", ".nuget", ".terraform", ".bundle", ".ccache",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
     #[cfg(windows)]
-    {
-        vec![
-            "\\$Recycle.Bin".into(),
-            "\\System Volume Information".into(),
-            "\\Windows\\WinSxS".into(),
-            "\\Windows\\servicing".into(),
+    list.extend(
+        [
+            "$Recycle.Bin",
+            "System Volume Information",
+            "\\Windows\\WinSxS",
+            "\\Windows\\servicing",
+            "\\Windows\\SoftwareDistribution",
+            "\\AppData\\Local\\Temp",
+            "\\AppData\\Local\\Microsoft\\Windows\\INetCache",
+            "\\AppData\\Local\\npm-cache",
+            "\\AppData\\Local\\pip",
+            "\\.cargo\\registry",
+            "\\.rustup\\toolchains",
         ]
-    }
+        .into_iter()
+        .map(String::from),
+    );
+
     #[cfg(not(windows))]
-    {
-        vec![
-            "/proc".into(),
-            "/sys".into(),
-            "/dev".into(),
-            "/run".into(),
-            "/.cache".into(),
+    list.extend(
+        [
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/snap",
+            ".cache",
+            "/.cargo/registry",
+            "/.rustup/toolchains",
+            ".local/share/Trash",
         ]
+        .into_iter()
+        .map(String::from),
+    );
+
+    list
+}
+
+/// Pre-split exclusion patterns for fast repeated matching during scans.
+pub struct ExclusionMatcher {
+    /// Patterns matched against whole path components (no separators).
+    components: Vec<String>,
+    /// Patterns matched as substrings of the full path (contain separators).
+    substrings: Vec<String>,
+}
+
+impl ExclusionMatcher {
+    pub fn new(exclusions: &[String]) -> Self {
+        let mut components = Vec::new();
+        let mut substrings = Vec::new();
+        for ex in exclusions {
+            let ex = ex.trim();
+            if ex.is_empty() {
+                continue;
+            }
+            if ex.contains('/') || ex.contains('\\') {
+                substrings.push(ex.to_string());
+            } else {
+                components.push(ex.to_ascii_lowercase());
+            }
+        }
+        ExclusionMatcher {
+            components,
+            substrings,
+        }
     }
+
+    pub fn matches(&self, path: &Path) -> bool {
+        if !self.components.is_empty() {
+            for comp in path.components() {
+                if let std::path::Component::Normal(os) = comp {
+                    let name = os.to_string_lossy();
+                    if self
+                        .components
+                        .iter()
+                        .any(|c| name.eq_ignore_ascii_case(c))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if !self.substrings.is_empty() {
+            let p = path.to_string_lossy();
+            if self
+                .substrings
+                .iter()
+                .any(|s| path_contains_segment(&p, s))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Case-insensitive substring match that only matches at path-component
+/// boundaries ("/proc" matches "/proc/cpuinfo" but not "/process.txt"), with
+/// `/` and `\` treated as interchangeable so patterns work cross-platform.
+fn path_contains_segment(haystack: &str, pattern: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = pattern.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return false;
+    }
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let eq = |a: u8, b: u8| {
+        a.to_ascii_lowercase() == b.to_ascii_lowercase() || (is_sep(a) && is_sep(b))
+    };
+    for start in 0..=(h.len() - n.len()) {
+        if h[start..start + n.len()].iter().zip(n).all(|(&a, &b)| eq(a, b)) {
+            let end = start + n.len();
+            if end == h.len() || is_sep(h[end]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn is_excluded(path: &Path, exclusions: &[String]) -> bool {
     if exclusions.is_empty() {
         return false;
     }
-    let p = path.to_string_lossy();
-    exclusions
-        .iter()
-        .any(|ex| !ex.is_empty() && contains_ignore_case(&p, ex))
+    ExclusionMatcher::new(exclusions).matches(path)
 }
 
 #[cfg(test)]
@@ -328,5 +445,24 @@ mod tests {
     fn test_thousands() {
         assert_eq!(thousands(1234567), "1,234,567");
         assert_eq!(thousands(12), "12");
+    }
+
+    #[test]
+    fn test_exclusion_matcher() {
+        let patterns: Vec<String> = vec![
+            ".git".into(),
+            "node_modules".into(),
+            "/proc".into(),
+        ];
+        let m = ExclusionMatcher::new(&patterns);
+        // Component patterns match whole components only.
+        assert!(m.matches(Path::new("/home/me/proj/.git/config")));
+        assert!(m.matches(Path::new("/home/me/app/node_modules")));
+        assert!(m.matches(Path::new("/home/me/app/NODE_MODULES/x.js")));
+        assert!(!m.matches(Path::new("/home/me/proj/.github/workflows/ci.yml")));
+        assert!(!m.matches(Path::new("/home/me/proj/.gitignore")));
+        // Separator patterns are path substrings.
+        assert!(m.matches(Path::new("/proc/cpuinfo")));
+        assert!(!m.matches(Path::new("/home/me/process.txt")));
     }
 }

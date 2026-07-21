@@ -2,7 +2,7 @@
 //! renamed, and deleted, so results stay accurate without rescanning.
 
 use crate::index::Index;
-use crate::util::is_excluded;
+use crate::util::ExclusionMatcher;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +54,7 @@ pub fn watch(
     }
 
     let stop2 = stop.clone();
+    let matcher = ExclusionMatcher::new(&exclusions);
     std::thread::Builder::new()
         .name("find-watcher".into())
         .spawn(move || {
@@ -82,7 +83,7 @@ pub fn watch(
                 let events = std::mem::take(&mut pending);
                 if let Ok(mut idx) = index.write() {
                     for event in events {
-                        apply_event(&mut idx, &event, &exclusions);
+                        apply_event(&mut idx, &event, &matcher);
                     }
                 }
                 dirty.store(true, Ordering::Relaxed);
@@ -96,9 +97,9 @@ pub fn watch(
     })
 }
 
-fn apply_event(index: &mut Index, event: &Event, exclusions: &[String]) {
+fn apply_event(index: &mut Index, event: &Event, matcher: &ExclusionMatcher) {
     for path in &event.paths {
-        if is_excluded(path, exclusions) {
+        if matcher.matches(path) {
             continue;
         }
         match event.kind {

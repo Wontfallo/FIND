@@ -76,6 +76,10 @@ pub struct FindApp {
     settings_roots_draft: String,
     settings_exclusions_draft: String,
     first_frame: bool,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    quit_requested: bool,
+    #[cfg(target_os = "windows")]
+    tray: Option<crate::tray::Tray>,
 }
 
 impl FindApp {
@@ -159,6 +163,9 @@ impl FindApp {
             settings_roots_draft,
             settings_exclusions_draft,
             first_frame: true,
+            quit_requested: false,
+            #[cfg(target_os = "windows")]
+            tray: crate::tray::init(cc.egui_ctx.clone()),
         }
     }
 
@@ -426,6 +433,8 @@ fn spawn_initial_load(
 
 impl eframe::App for FindApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_tray(ctx);
+
         // Drain search responses (keep only the newest valid one).
         let mut fresh = None;
         while let Ok(res) = self.res_rx.try_recv() {
@@ -473,6 +482,44 @@ impl eframe::App for FindApp {
 }
 
 impl FindApp {
+    /// Tray events + close-to-tray behavior. No-op outside Windows.
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            let mut rescan = false;
+            if let Some(tray) = &self.tray {
+                while let Ok(msg) = tray.rx.try_recv() {
+                    match msg {
+                        crate::tray::TrayMsg::Show => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                        crate::tray::TrayMsg::Rescan => rescan = true,
+                        crate::tray::TrayMsg::Quit => {
+                            self.quit_requested = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+            if rescan {
+                self.start_scan(ctx);
+            }
+            if self.settings.minimize_to_tray
+                && self.tray.is_some()
+                && !self.quit_requested
+                && ctx.input(|i| i.viewport().close_requested())
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = ctx;
+        }
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -853,6 +900,11 @@ impl FindApp {
                 ui.checkbox(
                     &mut self.settings.watch_filesystem,
                     "Watch filesystem for live updates (takes effect after restart)",
+                );
+                #[cfg(target_os = "windows")]
+                ui.checkbox(
+                    &mut self.settings.minimize_to_tray,
+                    "Keep running in the system tray when the window is closed",
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {

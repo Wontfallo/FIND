@@ -15,6 +15,8 @@ pub struct Settings {
     pub max_results: usize,
     pub show_preview: bool,
     pub watch_filesystem: bool,
+    /// Closing the window hides to the system tray instead of quitting.
+    pub minimize_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             max_results: 5_000,
             show_preview: true,
             watch_filesystem: true,
+            minimize_to_tray: true,
         }
     }
 }
