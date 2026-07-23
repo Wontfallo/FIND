@@ -348,8 +348,13 @@ impl FindApp {
 fn reveal_in_file_manager(path: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{path}"))
+        // Explorer's /select needs the path quoted as ONE raw argument.
+        // Command::arg's automatic quoting wraps "/select,path" in a way
+        // Explorer can't parse when the path contains spaces, and it falls
+        // back to opening the Documents folder.
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{path}\""))
             .spawn();
     }
     #[cfg(target_os = "macos")]
