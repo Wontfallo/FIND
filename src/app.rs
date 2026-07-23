@@ -574,11 +574,15 @@ impl eframe::App for FindApp {
 
         let scanning = self.scanning.load(Ordering::Relaxed);
 
-        // Watcher / scan progress: refresh counts and rerun the query, at most
-        // every 400 ms so a fast scan can't drown the UI in refreshes.
+        // Watcher / scan progress: rerun the current query so new files show
+        // up, but gently — every rerun replaces and re-sorts the visible
+        // results, so doing it fast reads as stutter. While a scan is
+        // running results refresh every 2.5s; for watcher events when idle,
+        // after 500ms. Typing always searches immediately (separate path).
+        let refresh_interval = if scanning { 2500 } else { 500 };
         let refresh_due = self
             .last_dirty_refresh
-            .is_none_or(|t| t.elapsed().as_millis() >= 400);
+            .is_none_or(|t| t.elapsed().as_millis() >= refresh_interval);
         if refresh_due && self.dirty.swap(false, Ordering::Relaxed) {
             self.last_dirty_refresh = Some(Instant::now());
             // While scanning, never touch the index lock from the UI thread —
