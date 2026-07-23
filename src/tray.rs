@@ -1,10 +1,18 @@
 //! System tray integration (Windows): FIND keeps running in the tray when the
 //! window is closed, exactly like Everything. Left-click the tray icon to
 //! bring the window back; right-click for a menu.
+//!
+//! Important subtlety: while the window is hidden, Windows delivers no paint
+//! events, so the egui update loop is asleep and can't process anything. Tray
+//! events therefore restore the window DIRECTLY via Win32 (ShowWindow) from
+//! the event thread — that revives the update loop, which then handles the
+//! queued message normally.
 #![cfg(target_os = "windows")]
 
 use crossbeam_channel::Receiver;
 use eframe::egui;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -19,7 +27,22 @@ pub struct Tray {
     pub rx: Receiver<TrayMsg>,
 }
 
-pub fn init(ctx: egui::Context) -> Option<Tray> {
+/// Restore and focus the main window via Win32, waking the egui loop.
+fn force_show(hwnd: &AtomicIsize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    let handle = hwnd.load(Ordering::Relaxed);
+    if handle != 0 {
+        unsafe {
+            ShowWindow(handle as _, SW_SHOW);
+            ShowWindow(handle as _, SW_RESTORE);
+            SetForegroundWindow(handle as _);
+        }
+    }
+}
+
+pub fn init(ctx: egui::Context, hwnd: Arc<AtomicIsize>) -> Option<Tray> {
     let (tx, rx) = crossbeam_channel::unbounded();
 
     let png = include_bytes!("../assets/icon-256.png");
@@ -44,11 +67,11 @@ pub fn init(ctx: egui::Context) -> Option<Tray> {
         .build()
         .ok()?;
 
-    // Handlers run on the event-loop thread; forward into a channel and wake
-    // the UI so it processes them even while the window is hidden.
+    // Left-click on the tray icon: bring the window back.
     {
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let hwnd = hwnd.clone();
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -56,11 +79,14 @@ pub fn init(ctx: egui::Context) -> Option<Tray> {
                 ..
             } = event
             {
+                force_show(&hwnd);
                 let _ = tx.send(TrayMsg::Show);
                 ctx.request_repaint();
             }
         }));
     }
+    // Right-click menu items. Every action first revives the window so the
+    // update loop is guaranteed to be running to process it.
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let msg = if event.id() == &show_id {
             TrayMsg::Show
@@ -71,6 +97,7 @@ pub fn init(ctx: egui::Context) -> Option<Tray> {
         } else {
             return;
         };
+        force_show(&hwnd);
         let _ = tx.send(msg);
         ctx.request_repaint();
     }));

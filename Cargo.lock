@@ -1410,11 +1410,13 @@ dependencies = [
  "nucleo-matcher",
  "open",
  "pdf-extract",
+ "raw-window-handle",
  "rayon",
  "regex",
  "serde",
  "serde_json",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]

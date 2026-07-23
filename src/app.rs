@@ -87,6 +87,10 @@ pub struct FindApp {
     quit_requested: bool,
     #[cfg(target_os = "windows")]
     tray: Option<crate::tray::Tray>,
+    /// Native window handle, shared with the tray so it can restore the
+    /// window even while the egui loop is asleep.
+    #[cfg(target_os = "windows")]
+    hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
 }
 
 /// Brand palette (matches the logo: deep navy, electric blue, violet).
@@ -167,6 +171,9 @@ impl FindApp {
             .join("\n");
         let settings_exclusions_draft = settings.exclusions.join("\n");
 
+        #[cfg(target_os = "windows")]
+        let hwnd = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
+
         FindApp {
             settings,
             query: String::new(),
@@ -201,7 +208,9 @@ impl FindApp {
             hidden: false,
             quit_requested: false,
             #[cfg(target_os = "windows")]
-            tray: crate::tray::init(cc.egui_ctx.clone()),
+            tray: crate::tray::init(cc.egui_ctx.clone(), hwnd.clone()),
+            #[cfg(target_os = "windows")]
+            hwnd,
         }
     }
 
@@ -487,6 +496,8 @@ fn spawn_initial_load(
 
 impl eframe::App for FindApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        self.capture_hwnd(_frame);
         self.handle_tray(ctx);
 
         // Drain search responses, keeping the newest. Accept anything newer
@@ -592,6 +603,22 @@ impl FindApp {
         std::process::exit(0);
     }
 
+    /// Remember the native window handle so tray events can restore the
+    /// window even while the egui update loop is asleep (hidden windows
+    /// receive no paint events, so the loop can't do it itself).
+    #[cfg(target_os = "windows")]
+    fn capture_hwnd(&self, frame: &eframe::Frame) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if self.hwnd.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        if let Ok(handle) = frame.window_handle() {
+            if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                self.hwnd.store(win.hwnd.get(), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Tray events + close-to-tray behavior. No-op outside Windows.
     fn handle_tray(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
@@ -609,7 +636,10 @@ impl FindApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         self.hidden = false;
                     }
-                    crate::tray::TrayMsg::Rescan => self.start_scan(ctx),
+                    crate::tray::TrayMsg::Rescan => {
+                        self.hidden = false;
+                        self.start_scan(ctx);
+                    }
                     crate::tray::TrayMsg::Quit => self.quit_now(),
                 }
             }
@@ -970,7 +1000,7 @@ impl FindApp {
                                 context_action = Some((i, RowAction::CopyName));
                                 ui.close();
                             }
-                            if ui.button("Copy folder path").clicked() {
+                            if ui.button("Copy containing folder").clicked() {
                                 context_action = Some((i, RowAction::CopyFolder));
                                 ui.close();
                             }
