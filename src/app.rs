@@ -60,6 +60,10 @@ pub struct FindApp {
     res_rx: Receiver<SearchResponse>,
     last_request: Option<SearchRequest>,
 
+    /// Generation of the results currently on screen.
+    displayed_generation: u64,
+    /// Last time a dirty-flag refresh re-ran the search.
+    last_dirty_refresh: Option<Instant>,
     results: Vec<Hit>,
     total: usize,
     truncated: bool,
@@ -178,6 +182,8 @@ impl FindApp {
             req_tx,
             res_rx,
             last_request: None,
+            displayed_generation: 0,
+            last_dirty_refresh: None,
             results: Vec::new(),
             total: 0,
             truncated: false,
@@ -483,14 +489,20 @@ impl eframe::App for FindApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray(ctx);
 
-        // Drain search responses (keep only the newest valid one).
-        let mut fresh = None;
+        // Drain search responses, keeping the newest. Accept anything newer
+        // than what's displayed — requiring an exact generation match starves
+        // the UI while the index is being built, because background flushes
+        // bump the generation faster than searches complete.
+        let mut fresh: Option<SearchResponse> = None;
         while let Ok(res) = self.res_rx.try_recv() {
-            if res.generation == self.generation.load(Ordering::Relaxed) {
+            if res.generation > self.displayed_generation
+                && fresh.as_ref().is_none_or(|f| res.generation > f.generation)
+            {
                 fresh = Some(res);
             }
         }
         if let Some(res) = fresh {
+            self.displayed_generation = res.generation;
             self.results = res.hits;
             self.total = res.total;
             self.truncated = res.truncated;
@@ -501,17 +513,30 @@ impl eframe::App for FindApp {
             }
         }
 
-        // Watcher / scan finished: refresh counts and rerun the query.
-        if self.dirty.swap(false, Ordering::Relaxed) {
-            self.index_count = self
-                .index
-                .read()
-                .map(|i| i.live_count())
-                .unwrap_or(self.index_count);
+        let scanning = self.scanning.load(Ordering::Relaxed);
+
+        // Watcher / scan progress: refresh counts and rerun the query, at most
+        // every 400 ms so a fast scan can't drown the UI in refreshes.
+        let refresh_due = self
+            .last_dirty_refresh
+            .is_none_or(|t| t.elapsed().as_millis() >= 400);
+        if refresh_due && self.dirty.swap(false, Ordering::Relaxed) {
+            self.last_dirty_refresh = Some(Instant::now());
+            // While scanning, never touch the index lock from the UI thread —
+            // a queued writer behind a long reader would freeze the window.
+            self.index_count = if scanning {
+                self.scan_progress.load(Ordering::Relaxed)
+            } else {
+                self.index
+                    .read()
+                    .map(|i| i.live_count())
+                    .unwrap_or(self.index_count)
+            };
             self.resend_search();
+        } else if self.dirty.load(Ordering::Relaxed) && !self.hidden {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
-        let scanning = self.scanning.load(Ordering::Relaxed);
         // Don't schedule repaints while hidden in the tray — a hidden window
         // can't paint, and the pending repaint request spins the CPU.
         if scanning && !self.hidden {
@@ -1007,7 +1032,20 @@ impl FindApp {
                         .font(egui::TextStyle::Monospace),
                 );
                 ui.add_space(6.0);
-                ui.label("Exclude paths containing (one per line):");
+                ui.horizontal(|ui| {
+                    ui.label("Exclude paths containing (one per line):");
+                    if ui
+                        .button("Restore defaults")
+                        .on_hover_text(
+                            "Reset to the built-in noise list (node_modules, venvs, \
+                             conda, docker, caches...). Click Save & Rescan to apply.",
+                        )
+                        .clicked()
+                    {
+                        self.settings_exclusions_draft =
+                            find_core::util::default_exclusions().join("\n");
+                    }
+                });
                 ui.add(
                     egui::TextEdit::multiline(&mut self.settings_exclusions_draft)
                         .desired_rows(4)

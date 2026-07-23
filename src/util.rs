@@ -269,6 +269,12 @@ pub fn default_exclusions() -> Vec<String> {
         // Python
         ".venv", "venv", "virtualenv", "__pycache__", ".tox", ".nox",
         ".mypy_cache", ".pytest_cache", ".ruff_cache", ".ipynb_checkpoints",
+        "site-packages", "__pypackages__", ".eggs",
+        // Conda (any env or package cache, wherever the install lives)
+        ".conda", "anaconda3/envs", "anaconda3/pkgs", "miniconda3/envs",
+        "miniconda3/pkgs", "mambaforge/envs", "mambaforge/pkgs",
+        // Docker
+        ".docker",
         // Other build/dependency caches
         ".gradle", ".m2", ".nuget", ".terraform", ".bundle", ".ccache",
     ]
