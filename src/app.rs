@@ -93,15 +93,15 @@ pub struct FindApp {
     hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
 }
 
-/// Brand palette (matches the logo: deep navy, electric blue, violet).
+/// Brand palette: deep neutral navy, with blue reserved for accents only.
 mod palette {
     use eframe::egui::Color32;
-    pub const BG: Color32 = Color32::from_rgb(13, 17, 32);
-    pub const BAR: Color32 = Color32::from_rgb(24, 33, 66);
-    pub const BAR_EDGE: Color32 = Color32::from_rgb(59, 130, 246);
-    pub const INPUT_BG: Color32 = Color32::from_rgb(8, 11, 24);
-    pub const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
-    pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(125, 200, 255);
+    pub const BG: Color32 = Color32::from_rgb(16, 18, 27);
+    pub const BAR: Color32 = Color32::from_rgb(24, 27, 40);
+    pub const BAR_EDGE: Color32 = Color32::from_rgb(70, 105, 180);
+    pub const INPUT_BG: Color32 = Color32::from_rgb(9, 11, 18);
+    pub const ACCENT: Color32 = Color32::from_rgb(45, 100, 210);
+    pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(140, 195, 255);
 }
 
 fn brand_visuals() -> egui::Visuals {
@@ -109,19 +109,42 @@ fn brand_visuals() -> egui::Visuals {
     v.panel_fill = palette::BG;
     v.window_fill = palette::BG;
     v.extreme_bg_color = palette::INPUT_BG;
-    v.faint_bg_color = egui::Color32::from_rgb(19, 25, 47); // table stripes
+    v.faint_bg_color = egui::Color32::from_rgb(22, 25, 36); // table stripes
     v.selection.bg_fill = palette::ACCENT;
     v.selection.stroke = egui::Stroke::new(1.0, palette::ACCENT_LIGHT);
     v.hyperlink_color = palette::ACCENT_LIGHT;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(31, 45, 90);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 44, 66);
     v.widgets.active.bg_fill = palette::ACCENT;
+    // Brighter text across the board: the dark-theme default grays are too
+    // dim against the navy background.
+    v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(225);
+    v.widgets.inactive.fg_stroke.color = egui::Color32::from_gray(220);
+    v.widgets.hovered.fg_stroke.color = egui::Color32::from_gray(245);
+    v.widgets.active.fg_stroke.color = egui::Color32::WHITE;
     v
+}
+
+/// Larger default type; users can still zoom the whole UI with Ctrl+= / Ctrl+-.
+fn brand_text_styles(ctx: &egui::Context) {
+    use egui::{FontId, TextStyle};
+    let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(TextStyle::Body, FontId::proportional(15.5));
+    style.text_styles.insert(TextStyle::Button, FontId::proportional(15.5));
+    style.text_styles.insert(TextStyle::Small, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(14.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(21.0));
+    ctx.set_style(style);
 }
 
 impl FindApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(brand_visuals());
+        brand_text_styles(&cc.egui_ctx);
 
         let settings = Settings::load();
         let index = Arc::new(RwLock::new(Index::default()));
@@ -677,7 +700,7 @@ impl FindApp {
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Search everything…  (try: report ext:pdf size:>1mb  or  content:\"todo\" ext:rs)")
-                        .font(egui::FontId::proportional(17.0))
+                        .font(egui::FontId::proportional(19.0))
                         .desired_width(ui.available_width() - 300.0),
                 );
                 if self.first_frame {
@@ -842,7 +865,7 @@ impl FindApp {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(text.as_str()).monospace().size(12.0),
+                                    egui::RichText::new(text.as_str()).monospace().size(13.5),
                                 )
                                 .wrap(),
                             );
@@ -898,7 +921,7 @@ impl FindApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             use egui_extras::{Column, TableBuilder};
 
-            let text_height = 20.0;
+            let text_height = 26.0;
             let mut clicked_row: Option<usize> = None;
             let mut double_clicked: Option<usize> = None;
             let mut context_action: Option<(usize, RowAction)> = None;
@@ -918,7 +941,7 @@ impl FindApp {
             }
 
             table
-                .header(22.0, |mut header| {
+                .header(26.0, |mut header| {
                     header.col(|ui| self.header_sort_button(ui, "Name", SortKey::Name));
                     header.col(|ui| self.header_sort_button(ui, "Path", SortKey::Path));
                     header.col(|ui| self.header_sort_button(ui, "Size", SortKey::Size));
@@ -971,7 +994,7 @@ impl FindApp {
                                         egui::Label::new(
                                             egui::RichText::new(format!("{n}: {line}"))
                                                 .monospace()
-                                                .size(11.0),
+                                                .size(12.5),
                                         )
                                         .truncate()
                                         .selectable(false),
