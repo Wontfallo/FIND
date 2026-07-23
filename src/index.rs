@@ -249,6 +249,7 @@ pub fn scan_into(
     let mut pending: Vec<Entry> = Vec::with_capacity(BATCH);
     let mut pending_dirs: Vec<(PathBuf, u32)> = Vec::new();
     let mut base: u32 = 0;
+    let mut flushes = 0usize;
 
     for root in roots {
         if cancel.load(Ordering::Relaxed) {
@@ -297,6 +298,14 @@ pub fn scan_into(
             progress.fetch_add(1, Ordering::Relaxed);
             if pending.len() >= BATCH {
                 flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+                flushes += 1;
+                // Persist progress every ~1M entries so an interrupted first
+                // scan still leaves a warm cache for the next launch.
+                if flushes % 16 == 0 {
+                    if let Ok(guard) = live.read() {
+                        let _ = save_to_disk(&guard);
+                    }
+                }
             }
         }
     }

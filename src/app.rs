@@ -76,6 +76,9 @@ pub struct FindApp {
     settings_roots_draft: String,
     settings_exclusions_draft: String,
     first_frame: bool,
+    /// True while the window is hidden in the tray.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    hidden: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     quit_requested: bool,
     #[cfg(target_os = "windows")]
@@ -189,6 +192,7 @@ impl FindApp {
             settings_roots_draft,
             settings_exclusions_draft,
             first_frame: true,
+            hidden: false,
             quit_requested: false,
             #[cfg(target_os = "windows")]
             tray: crate::tray::init(cc.egui_ctx.clone()),
@@ -508,7 +512,9 @@ impl eframe::App for FindApp {
         }
 
         let scanning = self.scanning.load(Ordering::Relaxed);
-        if scanning {
+        // Don't schedule repaints while hidden in the tray — a hidden window
+        // can't paint, and the pending repaint request spins the CPU.
+        if scanning && !self.hidden {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
 
@@ -523,31 +529,64 @@ impl eframe::App for FindApp {
         self.handle_keys(ctx);
         self.first_frame = false;
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Normal window close (tray disabled or non-Windows): stop the scan
+        // and persist whatever is indexed so the next launch starts warm.
+        self.scan_cancel.store(true, Ordering::Relaxed);
+        if let Ok(guard) = self.index.read() {
+            if !guard.entries.is_empty() {
+                let _ = index::save_to_disk(&guard);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.tray = None;
+        }
+    }
 }
 
 impl FindApp {
+    /// Save whatever is indexed so the next launch starts warm, remove the
+    /// tray icon (otherwise Windows leaves a ghost icon), and exit for real.
+    /// A plain window-close can silently fail when the window is hidden in
+    /// the tray, so Quit must not depend on the event loop winding down.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn quit_now(&mut self) {
+        self.quit_requested = true;
+        self.scan_cancel.store(true, Ordering::Relaxed);
+        if let Ok(guard) = self.index.read() {
+            if !guard.entries.is_empty() {
+                let _ = index::save_to_disk(&guard);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.tray = None;
+        }
+        std::process::exit(0);
+    }
+
     /// Tray events + close-to-tray behavior. No-op outside Windows.
     fn handle_tray(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")]
         {
-            let mut rescan = false;
+            let mut msgs = Vec::new();
             if let Some(tray) = &self.tray {
                 while let Ok(msg) = tray.rx.try_recv() {
-                    match msg {
-                        crate::tray::TrayMsg::Show => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        }
-                        crate::tray::TrayMsg::Rescan => rescan = true,
-                        crate::tray::TrayMsg::Quit => {
-                            self.quit_requested = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
+                    msgs.push(msg);
                 }
             }
-            if rescan {
-                self.start_scan(ctx);
+            for msg in msgs {
+                match msg {
+                    crate::tray::TrayMsg::Show => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.hidden = false;
+                    }
+                    crate::tray::TrayMsg::Rescan => self.start_scan(ctx),
+                    crate::tray::TrayMsg::Quit => self.quit_now(),
+                }
             }
             if self.settings.minimize_to_tray
                 && self.tray.is_some()
@@ -556,6 +595,7 @@ impl FindApp {
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden = true;
             }
         }
         #[cfg(not(target_os = "windows"))]
