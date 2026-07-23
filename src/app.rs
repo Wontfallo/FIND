@@ -65,6 +65,8 @@ pub struct FindApp {
     /// Last time a dirty-flag refresh re-ran the search.
     last_dirty_refresh: Option<Instant>,
     results: Vec<Hit>,
+    /// Scroll the table to the selected row next frame (set by keyboard nav).
+    scroll_to_selected: bool,
     total: usize,
     truncated: bool,
     search_ms: f32,
@@ -215,6 +217,7 @@ impl FindApp {
             displayed_generation: 0,
             last_dirty_refresh: None,
             results: Vec::new(),
+            scroll_to_selected: false,
             total: 0,
             truncated: false,
             search_ms: 0.0,
@@ -281,7 +284,18 @@ impl FindApp {
             .ok();
     }
 
+    /// Re-sort, keeping the selection on the same entry.
     fn apply_sort(&mut self) {
+        let selected_entry = self
+            .selected
+            .and_then(|s| self.results.get(s))
+            .map(|h| h.idx);
+        self.sort_results();
+        self.selected =
+            selected_entry.and_then(|key| self.results.iter().position(|h| h.idx == key));
+    }
+
+    fn sort_results(&mut self) {
         match self.sort {
             SortKey::Relevance => {
                 self.results.sort_by(|a, b| b.score.cmp(&a.score));
@@ -315,7 +329,6 @@ impl FindApp {
                 }
             }
         }
-        self.selected = None;
     }
 
     fn header_sort_button(&mut self, ui: &mut egui::Ui, label: &str, key: SortKey) {
@@ -541,15 +554,22 @@ impl eframe::App for FindApp {
             }
         }
         if let Some(res) = fresh {
+            // Selection follows the entry, not the row number: background
+            // refreshes (indexing, watcher) must never steal the user's spot.
+            let selected_entry = self
+                .selected
+                .and_then(|s| self.results.get(s))
+                .map(|h| h.idx);
             self.displayed_generation = res.generation;
             self.results = res.hits;
             self.total = res.total;
             self.truncated = res.truncated;
             self.search_ms = res.elapsed_ms;
-            self.selected = None;
             if self.sort != SortKey::Relevance {
-                self.apply_sort();
+                self.sort_results();
             }
+            self.selected = selected_entry
+                .and_then(|key| self.results.iter().position(|h| h.idx == key));
         }
 
         let scanning = self.scanning.load(Ordering::Relaxed);
@@ -931,7 +951,14 @@ impl FindApp {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
-                .sense(egui::Sense::click())
+                .sense(egui::Sense::click());
+            if self.scroll_to_selected {
+                if let Some(sel) = self.selected {
+                    table = table.scroll_to_row(sel, None);
+                }
+                self.scroll_to_selected = false;
+            }
+            let mut table = table
                 .column(Column::initial(320.0).at_least(120.0).clip(true))
                 .column(Column::remainder().at_least(150.0).clip(true))
                 .column(Column::initial(90.0).at_least(60.0))
@@ -1083,12 +1110,17 @@ impl FindApp {
             .default_width(480.0)
             .show(ctx, |ui| {
                 ui.label("Indexed locations (one per line):");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.settings_roots_draft)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("roots_scroll")
+                    .max_height(110.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.settings_roots_draft)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("Exclude paths containing (one per line):");
@@ -1104,12 +1136,17 @@ impl FindApp {
                             find_core::util::default_exclusions().join("\n");
                     }
                 });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.settings_exclusions_draft)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("exclusions_scroll")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.settings_exclusions_draft)
+                                .desired_rows(6)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("Max results:");
@@ -1219,10 +1256,12 @@ impl FindApp {
         if down && !self.results.is_empty() {
             let next = self.selected.map(|s| (s + 1).min(self.results.len() - 1)).unwrap_or(0);
             self.select(next);
+            self.scroll_to_selected = true;
         }
         if up && !self.results.is_empty() {
             let prev = self.selected.map(|s| s.saturating_sub(1)).unwrap_or(0);
             self.select(prev);
+            self.scroll_to_selected = true;
         }
         if enter && !self.results.is_empty() {
             let row = self.selected.unwrap_or(0);
