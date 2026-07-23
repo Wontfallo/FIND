@@ -1038,24 +1038,24 @@ impl FindApp {
                             double_clicked = Some(i);
                         }
                         response.context_menu(|ui| {
-                            if ui.button("Open").clicked() {
+                            if ui.button("Open File").clicked() {
                                 context_action = Some((i, RowAction::Open));
                                 ui.close();
                             }
-                            if ui.button("Open location").clicked() {
+                            if ui.button("Open Location").clicked() {
                                 context_action = Some((i, RowAction::Reveal));
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Copy full path").clicked() {
+                            if ui.button("Copy Path").clicked() {
                                 context_action = Some((i, RowAction::CopyPath));
                                 ui.close();
                             }
-                            if ui.button("Copy name").clicked() {
+                            if ui.button("Copy Name").clicked() {
                                 context_action = Some((i, RowAction::CopyName));
                                 ui.close();
                             }
-                            if ui.button("Copy containing folder").clicked() {
+                            if ui.button("Copy Folder Path").clicked() {
                                 context_action = Some((i, RowAction::CopyFolder));
                                 ui.close();
                             }
