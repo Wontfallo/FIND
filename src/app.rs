@@ -388,10 +388,17 @@ impl FindApp {
                     &cancel,
                     &completed,
                 );
-                let _ = index::save_to_disk(&new_index);
                 *index.write().unwrap() = new_index;
                 locked.store(false, Ordering::Relaxed);
                 scanning.store(false, Ordering::SeqCst);
+                dirty.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+                // The NTFS fast path leaves size/date blank; fill them in
+                // afterwards so sorting and size:/date: filters work.
+                Index::fill_metadata(&index, &progress, &cancel);
+                if let Ok(g) = index.read() {
+                    let _ = index::save_to_disk(&g);
+                }
                 dirty.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
             })
@@ -728,8 +735,14 @@ fn spawn_initial_load(
                         &completed,
                     );
                     if !cancel.load(Ordering::Relaxed) {
-                        let _ = index::save_to_disk(&new_index);
                         *index.write().unwrap() = new_index;
+                        index_locked.store(false, Ordering::Relaxed);
+                        dirty.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        Index::fill_metadata(&index, &progress, &cancel);
+                        if let Ok(g) = index.read() {
+                            let _ = index::save_to_disk(&g);
+                        }
                     }
                 }
                 None => {

@@ -91,6 +91,68 @@ impl Index {
         self.full_path(idx).to_string_lossy().into_owned()
     }
 
+    /// Public wrapper used by the NTFS fast path.
+    pub fn push_entry_pub(
+        &mut self,
+        name: &str,
+        parent: u32,
+        size: u64,
+        modified: i64,
+        is_dir: bool,
+    ) -> u32 {
+        self.push_entry(name, parent, size, modified, is_dir)
+    }
+
+    /// Fill in size/modified for entries left blank by the fast path. Runs in
+    /// parallel batches so the app stays responsive; `cancel` stops it.
+    pub fn fill_metadata(
+        index: &std::sync::RwLock<Self>,
+        progress: &AtomicUsize,
+        cancel: &AtomicBool,
+    ) {
+        use rayon::prelude::*;
+        const BATCH: usize = 20_000;
+        let total = match index.read() {
+            Ok(g) => g.entries.len(),
+            Err(_) => return,
+        };
+        let mut start = 0usize;
+        while start < total {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let end = (start + BATCH).min(total);
+            // Collect paths for this batch under a short read lock.
+            let paths: Vec<(u32, PathBuf)> = match index.read() {
+                Ok(g) => (start..end)
+                    .filter(|&i| g.entries[i].modified == 0 && !g.entries[i].is_deleted())
+                    .map(|i| (i as u32, g.full_path(i as u32)))
+                    .collect(),
+                Err(_) => return,
+            };
+            let stats: Vec<(u32, u64, i64)> = paths
+                .into_par_iter()
+                .filter_map(|(i, path)| {
+                    let meta = std::fs::symlink_metadata(&path).ok()?;
+                    Some((
+                        i,
+                        if meta.is_dir() { 0 } else { meta.len() },
+                        system_time_secs(meta.modified().ok()),
+                    ))
+                })
+                .collect();
+            if let Ok(mut g) = index.write() {
+                for (i, size, modified) in stats {
+                    let e = &mut g.entries[i as usize];
+                    e.size = size;
+                    e.modified = modified;
+                }
+            }
+            progress.store(end, Ordering::Relaxed);
+            start = end;
+        }
+    }
+
     fn push_entry(&mut self, name: &str, parent: u32, size: u64, modified: i64, is_dir: bool) -> u32 {
         let idx = self.entries.len() as u32;
         self.entries.push(Entry {
@@ -217,7 +279,15 @@ pub fn scan(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        scan_root(&mut index, root, exclusions, progress, cancel);
+        // Try the NTFS bulk read first (seconds instead of minutes); it
+        // reports false when unavailable and we walk directories instead.
+        #[cfg(target_os = "windows")]
+        let fast_ok = crate::mft::enumerate_volume(&mut index, root, exclusions, progress, cancel);
+        #[cfg(not(target_os = "windows"))]
+        let fast_ok = false;
+        if !fast_ok {
+            scan_root(&mut index, root, exclusions, progress, cancel);
+        }
         if !cancel.load(Ordering::Relaxed) {
             if let Ok(mut c) = completed.lock() {
                 c.insert(root.clone());
