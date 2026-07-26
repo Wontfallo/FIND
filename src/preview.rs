@@ -11,7 +11,12 @@ const DOC_PREVIEW_MAX: u64 = 8 * 1024 * 1024;
 pub enum PreviewContent {
     Empty,
     Text { text: String, truncated: bool },
-    Image { uri: String },
+    /// Image bytes loaded by us: the egui bytes-loader decodes them. (The
+    /// file:// URI loader proved unreliable, so we read the file directly.)
+    Image {
+        uri: String,
+        bytes: std::sync::Arc<[u8]>,
+    },
     Info(String),
 }
 
@@ -24,9 +29,15 @@ pub fn load(hit: &Hit) -> PreviewContent {
         ));
     }
     if is_image_ext(&hit.name) && hit.size <= IMAGE_PREVIEW_MAX {
-        return PreviewContent::Image {
-            uri: format!("file://{}", hit.path),
-        };
+        match std::fs::read(&hit.path) {
+            Ok(bytes) => {
+                return PreviewContent::Image {
+                    uri: format!("bytes://preview/{}", hit.path),
+                    bytes: std::sync::Arc::from(bytes.into_boxed_slice()),
+                }
+            }
+            Err(_) => return info_for(hit),
+        }
     }
     // Documents (PDF, DOCX, PPTX, XLSX, ODF): preview their extracted text.
     if find_core::doctext::is_document(&hit.name) && hit.size <= DOC_PREVIEW_MAX {

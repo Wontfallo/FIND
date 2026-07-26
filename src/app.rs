@@ -77,6 +77,12 @@ pub struct FindApp {
     preview: PreviewContent,
     preview_for: Option<u32>,
 
+    /// Live copy of settings for background threads (scheduler).
+    settings_shared: Arc<std::sync::Mutex<Settings>>,
+    /// Roots whose scan finished (drives the checkmarks in Settings).
+    completed_roots: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    /// Image URI to evict from egui's texture cache next frame.
+    pending_forget: Option<String>,
     show_settings: bool,
     show_help: bool,
     settings_roots_draft: String,
@@ -95,35 +101,94 @@ pub struct FindApp {
     hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
 }
 
-/// Brand palette: deep neutral navy, with blue reserved for accents only.
-mod palette {
-    use eframe::egui::Color32;
-    pub const BG: Color32 = Color32::from_rgb(16, 18, 27);
-    pub const BAR: Color32 = Color32::from_rgb(24, 27, 40);
-    pub const BAR_EDGE: Color32 = Color32::from_rgb(70, 105, 180);
-    pub const INPUT_BG: Color32 = Color32::from_rgb(9, 11, 18);
-    pub const ACCENT: Color32 = Color32::from_rgb(45, 100, 210);
-    pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(140, 195, 255);
+/// Theme colors resolved from the user's preset + accent choices.
+struct Theme {
+    bg: egui::Color32,
+    bar: egui::Color32,
+    stripe: egui::Color32,
+    input_bg: egui::Color32,
+    hover: egui::Color32,
+    accent: egui::Color32,
+    accent_light: egui::Color32,
 }
 
-fn brand_visuals() -> egui::Visuals {
+fn theme_of(settings: &Settings) -> Theme {
+    use egui::Color32;
+    use find_core::settings::{AccentColor, ThemePreset};
+    let (bg, bar, stripe, input_bg, hover) = match settings.theme {
+        // Warm dark grays/browns — easy on the eyes, zero blue cast.
+        ThemePreset::Graphite => (
+            Color32::from_rgb(22, 21, 19),
+            Color32::from_rgb(33, 30, 27),
+            Color32::from_rgb(27, 26, 24),
+            Color32::from_rgb(15, 14, 13),
+            Color32::from_rgb(45, 42, 38),
+        ),
+        ThemePreset::Carbon => (
+            Color32::from_rgb(16, 16, 16),
+            Color32::from_rgb(26, 26, 26),
+            Color32::from_rgb(21, 21, 21),
+            Color32::from_rgb(10, 10, 10),
+            Color32::from_rgb(38, 38, 38),
+        ),
+        ThemePreset::Navy => (
+            Color32::from_rgb(16, 18, 27),
+            Color32::from_rgb(24, 27, 40),
+            Color32::from_rgb(22, 25, 36),
+            Color32::from_rgb(9, 11, 18),
+            Color32::from_rgb(38, 44, 66),
+        ),
+    };
+    let accent = match settings.accent {
+        AccentColor::Blue => Color32::from_rgb(66, 133, 244),
+        AccentColor::Green => Color32::from_rgb(80, 170, 105),
+        AccentColor::Amber => Color32::from_rgb(214, 140, 60),
+        AccentColor::Violet => Color32::from_rgb(160, 125, 235),
+    };
+    let accent_light = Color32::from_rgb(
+        accent.r().saturating_add(70),
+        accent.g().saturating_add(70),
+        accent.b().saturating_add(50),
+    );
+    Theme { bg, bar, stripe, input_bg, hover, accent, accent_light }
+}
+
+fn apply_theme(ctx: &egui::Context, settings: &Settings) {
+    let t = theme_of(settings);
     let mut v = egui::Visuals::dark();
-    v.panel_fill = palette::BG;
-    v.window_fill = palette::BG;
-    v.extreme_bg_color = palette::INPUT_BG;
-    v.faint_bg_color = egui::Color32::from_rgb(22, 25, 36); // table stripes
-    v.selection.bg_fill = palette::ACCENT;
-    v.selection.stroke = egui::Stroke::new(1.0, palette::ACCENT_LIGHT);
-    v.hyperlink_color = palette::ACCENT_LIGHT;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 44, 66);
-    v.widgets.active.bg_fill = palette::ACCENT;
-    // Brighter text across the board: the dark-theme default grays are too
-    // dim against the navy background.
-    v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(225);
-    v.widgets.inactive.fg_stroke.color = egui::Color32::from_gray(220);
-    v.widgets.hovered.fg_stroke.color = egui::Color32::from_gray(245);
+    v.panel_fill = t.bg;
+    v.window_fill = t.bg;
+    v.extreme_bg_color = t.input_bg;
+    v.faint_bg_color = t.stripe;
+    v.selection.bg_fill = t.accent;
+    v.selection.stroke = egui::Stroke::new(1.0, t.accent_light);
+    v.hyperlink_color = t.accent_light;
+    v.widgets.hovered.bg_fill = t.hover;
+    v.widgets.active.bg_fill = t.accent;
+    // Bright warm-white text for contrast against the dark background.
+    v.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(232, 229, 224);
+    v.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(226, 223, 218);
+    v.widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(248, 246, 242);
     v.widgets.active.fg_stroke.color = egui::Color32::WHITE;
-    v
+    ctx.set_visuals(v);
+}
+
+/// Register MesloLGS Nerd Font Mono as the primary UI font (with egui's
+/// defaults as fallback for any glyph it lacks).
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "meslo-nf".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/MesloLGS-NF-Regular.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.insert(0, "meslo-nf".into());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Larger default type; users can still zoom the whole UI with Ctrl+= / Ctrl+-.
@@ -145,16 +210,25 @@ fn brand_text_styles(ctx: &egui::Context) {
 impl FindApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(brand_visuals());
+        install_fonts(&cc.egui_ctx);
         brand_text_styles(&cc.egui_ctx);
 
         let settings = Settings::load();
+        apply_theme(&cc.egui_ctx, &settings);
+        if (settings.ui_scale - 1.0).abs() > 0.01 {
+            cc.egui_ctx.set_zoom_factor(settings.ui_scale);
+        }
         let index = Arc::new(RwLock::new(Index::default()));
         let scanning = Arc::new(AtomicBool::new(false));
         let scan_progress = Arc::new(AtomicUsize::new(0));
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
+
+        let settings_shared = Arc::new(std::sync::Mutex::new(settings.clone()));
+        let completed_roots = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
 
         let (req_tx, req_rx) = crossbeam_channel::unbounded::<SearchRequest>();
         let (res_tx, res_rx) = crossbeam_channel::unbounded::<SearchResponse>();
@@ -174,6 +248,19 @@ impl FindApp {
             scan_progress.clone(),
             scan_cancel.clone(),
             dirty.clone(),
+            completed_roots.clone(),
+            cc.egui_ctx.clone(),
+        );
+        // Daily scheduled rescan (checks the configured HH:MM every 30s;
+        // works even while the window sleeps hidden in the tray).
+        spawn_rescan_scheduler(
+            settings_shared.clone(),
+            index.clone(),
+            scanning.clone(),
+            scan_progress.clone(),
+            scan_cancel.clone(),
+            dirty.clone(),
+            completed_roots.clone(),
             cc.egui_ctx.clone(),
         );
 
@@ -228,6 +315,9 @@ impl FindApp {
             preview_for: None,
             show_settings: false,
             show_help: false,
+            settings_shared,
+            completed_roots,
+            pending_forget: None,
             settings_roots_draft,
             settings_exclusions_draft,
             first_frame: true,
@@ -238,6 +328,14 @@ impl FindApp {
             #[cfg(target_os = "windows")]
             hwnd,
         }
+    }
+
+    /// Save settings to disk and update the copy background threads see.
+    fn persist_settings(&self) {
+        if let Ok(mut shared) = self.settings_shared.lock() {
+            *shared = self.settings.clone();
+        }
+        self.settings.save();
     }
 
     fn send_search(&mut self) {
@@ -269,12 +367,18 @@ impl FindApp {
         let progress = self.scan_progress.clone();
         let cancel = self.scan_cancel.clone();
         let dirty = self.dirty.clone();
+        let completed = self.completed_roots.clone();
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name("find-scan".into())
             .spawn(move || {
-                let new_index =
-                    index::scan(&settings.roots, &settings.exclusions, &progress, &cancel);
+                let new_index = index::scan(
+                    &settings.roots,
+                    &settings.exclusions,
+                    &progress,
+                    &cancel,
+                    &completed,
+                );
                 let _ = index::save_to_disk(&new_index);
                 *index.write().unwrap() = new_index;
                 scanning.store(false, Ordering::SeqCst);
@@ -346,7 +450,13 @@ impl FindApp {
             .clicked()
         {
             if self.sort == key {
-                self.sort_descending = !self.sort_descending;
+                if self.sort_descending {
+                    self.sort_descending = false;
+                } else {
+                    // Third click returns to relevance ordering.
+                    self.sort = SortKey::Relevance;
+                    self.sort_descending = true;
+                }
             } else {
                 self.sort = key;
                 self.sort_descending = true;
@@ -361,6 +471,9 @@ impl FindApp {
             if self.preview_for != Some(hit.idx) {
                 self.preview_for = Some(hit.idx);
                 if self.settings.show_preview {
+                    if let PreviewContent::Image { uri, .. } = &self.preview {
+                        self.pending_forget = Some(uri.clone());
+                    }
                     self.preview = preview::load(hit);
                 }
             }
@@ -481,6 +594,76 @@ fn spawn_search_worker(
         .ok();
 }
 
+/// Normalize "4:00" / "04:00" to "HH:MM"; None if not a valid 24h time.
+fn normalize_hhmm(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return None;
+    }
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(format!("{h:02}:{m:02}"))
+}
+
+/// Background thread: fires a full rescan once a day at the configured time.
+/// Runs independently of the UI loop, so it works while the window is hidden
+/// in the tray.
+#[allow(clippy::too_many_arguments)]
+fn spawn_rescan_scheduler(
+    settings_shared: Arc<std::sync::Mutex<Settings>>,
+    index: Arc<RwLock<Index>>,
+    scanning: Arc<AtomicBool>,
+    progress: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
+    completed: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    ctx: egui::Context,
+) {
+    std::thread::Builder::new()
+        .name("find-scheduler".into())
+        .spawn(move || {
+            let mut last_run_day: Option<chrono::NaiveDate> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let (time_cfg, roots, exclusions) = match settings_shared.lock() {
+                    Ok(s) => (
+                        s.auto_rescan_time.clone(),
+                        s.roots.clone(),
+                        s.exclusions.clone(),
+                    ),
+                    Err(_) => continue,
+                };
+                if time_cfg.is_empty() {
+                    continue;
+                }
+                let now = chrono::Local::now();
+                let today = now.date_naive();
+                if now.format("%H:%M").to_string() != time_cfg || last_run_day == Some(today) {
+                    continue;
+                }
+                last_run_day = Some(today);
+                if scanning.swap(true, Ordering::SeqCst) {
+                    continue; // a scan is already running
+                }
+                cancel.store(false, Ordering::Relaxed);
+                let new_index = index::scan(&roots, &exclusions, &progress, &cancel, &completed);
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = index::save_to_disk(&new_index);
+                    if let Ok(mut guard) = index.write() {
+                        *guard = new_index;
+                    }
+                }
+                scanning.store(false, Ordering::SeqCst);
+                dirty.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        })
+        .ok();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_initial_load(
     settings: Settings,
@@ -489,6 +672,7 @@ fn spawn_initial_load(
     progress: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
+    completed: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     ctx: egui::Context,
 ) {
     std::thread::Builder::new()
@@ -505,8 +689,13 @@ fn spawn_initial_load(
                     *index.write().unwrap() = loaded;
                     dirty.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
-                    let new_index =
-                        index::scan(&settings.roots, &settings.exclusions, &progress, &cancel);
+                    let new_index = index::scan(
+                        &settings.roots,
+                        &settings.exclusions,
+                        &progress,
+                        &cancel,
+                        &completed,
+                    );
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = index::save_to_disk(&new_index);
                         *index.write().unwrap() = new_index;
@@ -522,6 +711,7 @@ fn spawn_initial_load(
                         &progress,
                         &cancel,
                         &dirty,
+                        &completed,
                     );
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = index::save_to_disk(&index.read().unwrap());
@@ -540,6 +730,9 @@ impl eframe::App for FindApp {
         #[cfg(target_os = "windows")]
         self.capture_hwnd(_frame);
         self.handle_tray(ctx);
+        if let Some(uri) = self.pending_forget.take() {
+            ctx.forget_image(&uri);
+        }
 
         // Drain search responses, keeping the newest. Accept anything newer
         // than what's displayed — requiring an exact generation match starves
@@ -712,12 +905,13 @@ impl FindApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        // Distinct brand-navy bar with a blue accent line, so the app's
-        // toolbar reads clearly against the OS title bar above it.
+        // Distinct toolbar tint with an accent edge, so the app's toolbar
+        // reads clearly against the OS title bar above it.
+        let t = theme_of(&self.settings);
         let frame = egui::Frame::default()
-            .fill(palette::BAR)
+            .fill(t.bar)
             .inner_margin(egui::Margin::symmetric(8, 4))
-            .stroke(egui::Stroke::new(1.0, palette::BAR_EDGE));
+            .stroke(egui::Stroke::new(1.0, t.accent.gamma_multiply(0.6)));
         egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -745,7 +939,7 @@ impl FindApp {
                     });
                 if mode != self.settings.match_mode {
                     self.settings.match_mode = mode;
-                    self.settings.save();
+                    self.persist_settings();
                     self.send_search();
                 }
 
@@ -757,7 +951,7 @@ impl FindApp {
                 {
                     case = !case;
                     self.settings.case_sensitive = case;
-                    self.settings.save();
+                    self.persist_settings();
                     self.send_search();
                 }
 
@@ -766,7 +960,7 @@ impl FindApp {
                     .clicked()
                 {
                     self.settings.show_preview = !self.settings.show_preview;
-                    self.settings.save();
+                    self.persist_settings();
                 }
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
                     self.show_settings = !self.show_settings;
@@ -793,7 +987,7 @@ impl FindApp {
 
     fn status_bar(&mut self, ctx: &egui::Context, scanning: bool) {
         let frame = egui::Frame::default()
-            .fill(palette::BAR)
+            .fill(theme_of(&self.settings).bar)
             .inner_margin(egui::Margin::symmetric(8, 4));
         egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -823,7 +1017,14 @@ impl FindApp {
                     ));
                 } else {
                     ui.separator();
-                    if ui.button("⟳ Rescan").clicked() {
+                    if ui
+                        .button("\u{f021} Rescan")
+                        .on_hover_text(
+                            "Re-walks every indexed location from scratch and replaces \
+                             the index. Searching stays available the whole time.",
+                        )
+                        .clicked()
+                    {
                         self.start_scan(ctx);
                     }
                 }
@@ -875,12 +1076,15 @@ impl FindApp {
                     PreviewContent::Info(text) => {
                         ui.label(text.as_str());
                     }
-                    PreviewContent::Image { uri } => {
+                    PreviewContent::Image { uri, bytes } => {
                         egui::ScrollArea::both().show(ui, |ui| {
                             ui.add(
-                                egui::Image::new(uri.as_str())
-                                    .max_size(ui.available_size())
-                                    .maintain_aspect_ratio(true),
+                                egui::Image::from_bytes(
+                                    uri.clone(),
+                                    egui::load::Bytes::Shared(bytes.clone()),
+                                )
+                                .max_size(ui.available_size())
+                                .maintain_aspect_ratio(true),
                             );
                         });
                     }
@@ -989,12 +1193,22 @@ impl FindApp {
                         let hit = &self.results[i];
                         row.set_selected(self.selected == Some(i));
                         row.col(|ui| {
-                            let icon = if hit.is_dir { "📁" } else { file_icon(&hit.name) };
-                            ui.add(
-                                egui::Label::new(format!("{icon} {}", hit.name))
-                                    .truncate()
+                            let (icon, color) =
+                                if hit.is_dir { FOLDER_ICON } else { file_icon(&hit.name) };
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(icon).color(color),
+                                    )
                                     .selectable(false),
-                            );
+                                );
+                                ui.add(
+                                    egui::Label::new(&hit.name)
+                                        .truncate()
+                                        .selectable(false),
+                                );
+                            });
                         });
                         row.col(|ui| {
                             ui.add(
@@ -1113,7 +1327,89 @@ impl FindApp {
             .open(&mut open)
             .default_width(480.0)
             .show(ctx, |ui| {
+                // --- Appearance ---
+                let mut theme_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Theme:");
+                    for preset in find_core::settings::ThemePreset::ALL {
+                        if ui
+                            .selectable_label(self.settings.theme == preset, preset.label())
+                            .clicked()
+                        {
+                            self.settings.theme = preset;
+                            theme_changed = true;
+                        }
+                    }
+                    ui.separator();
+                    ui.label("Accent:");
+                    for accent in find_core::settings::AccentColor::ALL {
+                        if ui
+                            .selectable_label(self.settings.accent == accent, accent.label())
+                            .clicked()
+                        {
+                            self.settings.accent = accent;
+                            theme_changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Text size:");
+                    let mut scale = self.settings.ui_scale;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut scale, 0.8..=2.0)
+                                .step_by(0.05)
+                                .show_value(false),
+                        )
+                        .changed()
+                    {
+                        self.settings.ui_scale = scale;
+                        theme_changed = true;
+                    }
+                    ui.label(format!("{:.0}%", self.settings.ui_scale * 100.0));
+                    ui.label(
+                        egui::RichText::new("(or Ctrl+= / Ctrl+-)")
+                            .small()
+                            .weak(),
+                    );
+                });
+                if theme_changed {
+                    apply_theme(ctx, &self.settings);
+                    ctx.set_zoom_factor(self.settings.ui_scale);
+                    self.persist_settings();
+                }
+                ui.separator();
+
                 ui.label("Indexed locations (one per line):");
+                // Per-root scan status, so you can see what's actually indexed.
+                {
+                    let completed = self
+                        .completed_roots
+                        .lock()
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
+                    let scanning = self.scanning.load(Ordering::Relaxed);
+                    for line in self
+                        .settings_roots_draft
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                    {
+                        let path = std::path::PathBuf::from(line);
+                        let (icon, color, note) = if completed.contains(&path) {
+                            ("\u{f00c}", egui::Color32::from_rgb(120, 200, 130), "indexed")
+                        } else if scanning {
+                            ("\u{f254}", egui::Color32::from_rgb(220, 180, 90), "indexing…")
+                        } else {
+                            ("\u{f071}", egui::Color32::from_rgb(200, 120, 110), "not indexed yet")
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(icon).color(color));
+                            ui.label(line);
+                            ui.label(egui::RichText::new(note).small().weak());
+                        });
+                    }
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("roots_scroll")
                     .max_height(110.0)
@@ -1171,6 +1467,21 @@ impl FindApp {
                     &mut self.settings.minimize_to_tray,
                     "Keep running in the system tray when the window is closed",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Daily rescan at:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.auto_rescan_time)
+                            .hint_text("04:00")
+                            .desired_width(70.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "24h time, blank = off. Runs while FIND sits in the tray.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -1205,7 +1516,10 @@ impl FindApp {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
-        self.settings.save();
+        // Normalize the rescan time ("4:00" -> "04:00"; invalid -> off).
+        let t = self.settings.auto_rescan_time.trim().to_string();
+        self.settings.auto_rescan_time = normalize_hhmm(&t).unwrap_or_default();
+        self.persist_settings();
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
@@ -1293,20 +1607,26 @@ enum RowAction {
     CopyFolder,
 }
 
-fn file_icon(name: &str) -> &'static str {
+/// Nerd Font glyph + color per file kind (the colorful icons in the list).
+fn file_icon(name: &str) -> (&'static str, egui::Color32) {
+    use egui::Color32;
     if Category::Images.matches(name, false) {
-        "🖼"
+        ("\u{f1c5}", Color32::from_rgb(198, 120, 221)) // violet
     } else if Category::Audio.matches(name, false) {
-        "🎵"
+        ("\u{f001}", Color32::from_rgb(152, 195, 121)) // green
     } else if Category::Video.matches(name, false) {
-        "🎬"
+        ("\u{f03d}", Color32::from_rgb(224, 108, 117)) // red
     } else if Category::Archives.matches(name, false) {
-        "📦"
+        ("\u{f1c6}", Color32::from_rgb(176, 137, 104)) // tan
     } else if Category::Code.matches(name, false) {
-        "📜"
+        ("\u{f121}", Color32::from_rgb(97, 175, 239)) // blue
     } else if Category::Executables.matches(name, false) {
-        "⚙"
+        ("\u{f013}", Color32::from_rgb(229, 192, 123)) // gold
+    } else if Category::Documents.matches(name, false) {
+        ("\u{f15c}", Color32::from_rgb(171, 178, 191)) // gray
     } else {
-        "📄"
+        ("\u{f15b}", Color32::from_rgb(140, 146, 160)) // dim gray
     }
 }
+
+const FOLDER_ICON: (&str, egui::Color32) = ("\u{f07b}", egui::Color32::from_rgb(229, 192, 123));

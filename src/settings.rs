@@ -5,9 +5,63 @@ use crate::util::{default_exclusions, default_roots};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ThemePreset {
+    /// Warm dark grays and browns (default).
+    #[default]
+    Graphite,
+    /// Pure blacks.
+    Carbon,
+    /// The original dark navy.
+    Navy,
+}
+
+impl ThemePreset {
+    pub const ALL: [ThemePreset; 3] = [ThemePreset::Graphite, ThemePreset::Carbon, ThemePreset::Navy];
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePreset::Graphite => "Graphite",
+            ThemePreset::Carbon => "Carbon",
+            ThemePreset::Navy => "Navy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum AccentColor {
+    #[default]
+    Blue,
+    Green,
+    Amber,
+    Violet,
+}
+
+impl AccentColor {
+    pub const ALL: [AccentColor; 4] = [
+        AccentColor::Blue,
+        AccentColor::Green,
+        AccentColor::Amber,
+        AccentColor::Violet,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            AccentColor::Blue => "Blue",
+            AccentColor::Green => "Green",
+            AccentColor::Amber => "Amber",
+            AccentColor::Violet => "Violet",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub theme: ThemePreset,
+    pub accent: AccentColor,
+    /// UI zoom factor (also adjustable live with Ctrl+= / Ctrl+-).
+    pub ui_scale: f32,
+    /// "HH:MM" 24h local time for a daily automatic rescan; empty = off.
+    pub auto_rescan_time: String,
     pub roots: Vec<PathBuf>,
     pub exclusions: Vec<String>,
     pub match_mode: MatchMode,
@@ -22,6 +76,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            theme: ThemePreset::default(),
+            accent: AccentColor::default(),
+            ui_scale: 1.0,
+            auto_rescan_time: String::new(),
             roots: default_roots(),
             exclusions: default_exclusions(),
             match_mode: MatchMode::Substring,

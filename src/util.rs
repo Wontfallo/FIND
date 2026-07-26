@@ -2,13 +2,14 @@
 
 use std::path::Path;
 
-/// Case-insensitive (ASCII) substring test without allocating.
-pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+/// Case-insensitive (ASCII) substring search returning the byte offset of the
+/// first match, without allocating.
+pub fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
-        return true;
+        return Some(0);
     }
     if needle.len() > haystack.len() {
-        return false;
+        return None;
     }
     let h = haystack.as_bytes();
     let n = needle.as_bytes();
@@ -22,10 +23,15 @@ pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
             .zip(n)
             .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
         {
-            return true;
+            return Some(start);
         }
     }
-    false
+    None
+}
+
+/// Case-insensitive (ASCII) substring test without allocating.
+pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    find_ignore_case(haystack, needle).is_some()
 }
 
 pub fn human_size(bytes: u64) -> String {

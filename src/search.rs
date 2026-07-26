@@ -216,36 +216,48 @@ fn make_hit(index: &Index, idx: u32, score: u32, content_line: Option<(u64, Stri
     }
 }
 
-/// All terms must appear in the name. Better scores for prefix matches and
-/// shorter names, so exact-ish hits float to the top.
+/// All terms must appear in the name. Ranking (searching "dog"):
+///   exact name          "dog"                  best
+///   exact stem          "dog.png"
+///   word at the start   "dog park.jpg"
+///   word anywhere       "my dog photos.png"
+///   prefix of a name    "dogecoin.pdf"
+///   buried substring    "hotdog_recipes.txt"   worst
+/// Shorter names get a small boost as a tiebreaker.
 fn substring_score(name: &str, spec: &SearchSpec) -> Option<u32> {
     if spec.name_terms.is_empty() {
         return Some(1);
     }
+    let is_boundary = |b: u8| !b.is_ascii_alphanumeric();
+    let stem_len = crate::util::extension_of(name)
+        .map(|e| name.len() - e.len() - 1)
+        .unwrap_or(name.len());
+
     let mut score = 0u32;
     for term in &spec.name_terms {
-        let matched = if spec.case_sensitive {
-            name.contains(term.as_str())
+        let pos = if spec.case_sensitive {
+            name.find(term.as_str())
         } else {
-            contains_ignore_case(name, term)
+            crate::util::find_ignore_case(name, term)
         };
-        if !matched {
-            return None;
-        }
-        let prefix = if spec.case_sensitive {
-            name.starts_with(term.as_str())
+        let Some(pos) = pos else { return None };
+        let end = pos + term.len();
+        let start_ok = pos == 0 || is_boundary(name.as_bytes()[pos - 1]);
+        let end_ok = end == name.len() || is_boundary(name.as_bytes()[end]);
+
+        score += if pos == 0 && end == name.len() {
+            5000 // exact whole name
+        } else if pos == 0 && end == stem_len {
+            4000 // exact stem: "dog" matches "dog.png"
+        } else if pos == 0 && end_ok {
+            1500 // whole word at the start
+        } else if start_ok && end_ok {
+            700 // whole word somewhere inside
+        } else if pos == 0 {
+            400 // prefix of a longer word
         } else {
-            name.len() >= term.len()
-                && name.as_bytes()[..term.len()]
-                    .iter()
-                    .zip(term.as_bytes())
-                    .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            100 // buried substring
         };
-        score += if prefix { 500 } else { 100 };
-        // Whole-name match is best.
-        if name.len() == term.len() && matched {
-            score += 1000;
-        }
     }
     score += 200u32.saturating_sub(name.len().min(200) as u32);
     Some(score)
@@ -273,7 +285,8 @@ mod tests {
         std::fs::write(tmp.join("docs").join("summary_report.txt"), b"x").unwrap();
         let progress = AtomicUsize::new(0);
         let cancel = AtomicBool::new(false);
-        let index = crate::index::scan(&[tmp.clone()], &[], &progress, &cancel);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let index = crate::index::scan(&[tmp.clone()], &[], &progress, &cancel, &completed);
         (index, tmp)
     }
 
@@ -312,6 +325,37 @@ mod tests {
         assert_eq!(out.total, 1);
         assert_eq!(out.hits[0].name, "notes.txt");
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_relevance_ranking() {
+        let tmp = std::env::temp_dir().join(format!(
+            "find_rank_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for name in [
+            "dog.png",
+            "dog park.jpg",
+            "my dog photos.png",
+            "dogecoin_whitepaper.pdf",
+            "hotdog_recipes.txt",
+        ] {
+            std::fs::write(tmp.join(name), b"x").unwrap();
+        }
+        let progress = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let index = crate::index::scan(&[tmp.clone()], &[], &progress, &cancel, &completed);
+        let out = run(&index, "dog", MatchMode::Substring);
+        let names: Vec<&str> = out.hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names[0], "dog.png", "exact stem must rank first: {names:?}");
+        assert_eq!(names[1], "dog park.jpg", "word-at-start second: {names:?}");
+        let buried = names.iter().position(|n| *n == "hotdog_recipes.txt").unwrap();
+        let word = names.iter().position(|n| *n == "my dog photos.png").unwrap();
+        assert!(word < buried, "word match must beat buried substring: {names:?}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

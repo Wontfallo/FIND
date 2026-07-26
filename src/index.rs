@@ -187,7 +187,11 @@ pub fn scan(
     exclusions: &[String],
     progress: &AtomicUsize,
     cancel: &AtomicBool,
+    completed: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 ) -> Index {
+    if let Ok(mut c) = completed.lock() {
+        c.clear();
+    }
     let mut index = Index {
         roots: roots.to_vec(),
         scanned_at: system_time_secs(Some(SystemTime::now())),
@@ -200,6 +204,11 @@ pub fn scan(
             break;
         }
         scan_root(&mut index, root, exclusions, progress, cancel);
+        if !cancel.load(Ordering::Relaxed) {
+            if let Ok(mut c) = completed.lock() {
+                c.insert(root.clone());
+            }
+        }
     }
     index
 }
@@ -232,7 +241,11 @@ pub fn scan_into(
     progress: &AtomicUsize,
     cancel: &AtomicBool,
     dirty: &AtomicBool,
+    completed: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 ) {
+    if let Ok(mut c) = completed.lock() {
+        c.clear();
+    }
     const BATCH: usize = 65_536;
     {
         let mut guard = live.write().unwrap();
@@ -307,6 +320,11 @@ pub fn scan_into(
                     }
                     last_save = std::time::Instant::now();
                 }
+            }
+        }
+        if !cancel.load(Ordering::Relaxed) {
+            if let Ok(mut c) = completed.lock() {
+                c.insert(root.clone());
             }
         }
     }
@@ -419,7 +437,10 @@ mod tests {
     fn build_test_index(dir: &Path) -> Index {
         let progress = AtomicUsize::new(0);
         let cancel = AtomicBool::new(false);
-        scan(&[dir.to_path_buf()], &[], &progress, &cancel)
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let index = scan(&[dir.to_path_buf()], &[], &progress, &cancel, &completed);
+        assert!(completed.lock().unwrap().contains(dir));
+        index
     }
 
     #[test]
@@ -464,7 +485,9 @@ mod tests {
         let progress = AtomicUsize::new(0);
         let cancel = AtomicBool::new(false);
         let dirty = AtomicBool::new(false);
-        scan_into(&live, &[tmp.clone()], &[], &progress, &cancel, &dirty);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        scan_into(&live, &[tmp.clone()], &[], &progress, &cancel, &dirty, &completed);
+        assert!(completed.lock().unwrap().contains(&tmp));
 
         assert!(dirty.load(Ordering::Relaxed));
         let guard = live.read().unwrap();
