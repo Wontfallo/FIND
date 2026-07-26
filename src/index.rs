@@ -54,10 +54,24 @@ impl Index {
     pub fn full_path(&self, idx: u32) -> PathBuf {
         let mut parts: Vec<&str> = Vec::with_capacity(16);
         let mut cur = idx;
+        let mut hops = 0;
         loop {
-            let e = &self.entries[cur as usize];
+            let Some(e) = self.entries.get(cur as usize) else {
+                break;
+            };
             parts.push(&e.name);
             if e.parent == NO_PARENT {
+                break;
+            }
+            // Defensive: a parent must be a directory, and paths are not
+            // thousands of levels deep. Either signals a corrupt pointer —
+            // stop rather than emitting a nonsense file-inside-file chain.
+            match self.entries.get(e.parent as usize) {
+                Some(p) if p.is_dir() => {}
+                _ => break,
+            }
+            hops += 1;
+            if hops > 256 {
                 break;
             }
             cur = e.parent;
@@ -481,6 +495,25 @@ mod tests {
         assert!(!hello.is_dir());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_full_path_rejects_file_as_parent() {
+        // Regression: a corrupt parent pointer (file used as a parent) once
+        // produced absurd "a.mp4\b.zip\c.dll\..." chains.
+        let mut index = Index::default();
+        let root = index.push_entry("C:\\", NO_PARENT, 0, 0, true);
+        let file = index.push_entry("video.mp4", root, 10, 0, false);
+        // Corrupt: point an entry at a *file* as its parent.
+        let bogus = index.push_entry("thing.png", file, 5, 0, false);
+        let path = index.full_path(bogus);
+        assert_eq!(
+            path,
+            PathBuf::from("thing.png"),
+            "must not chain through a file parent"
+        );
+        // A well-formed entry still resolves fully.
+        assert_eq!(index.full_path(file), PathBuf::from("C:\\").join("video.mp4"));
     }
 
     #[test]

@@ -41,7 +41,8 @@ pub fn execute(
 ) -> Option<SearchOutcome> {
     let cancelled = || current.load(Ordering::Relaxed) != generation;
 
-    // Empty query with no category: show the index in natural order (cheap).
+    // Empty query with no category: show the index in natural order (cheap:
+    // no scoring, no sort — just the first `max_results` live entries).
     if spec.is_empty() && category == Category::All {
         let hits: Vec<Hit> = index
             .entries
@@ -182,8 +183,16 @@ pub fn execute(
     }
 
     let total = scored.len();
-    scored.par_sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    scored.truncate(max_results);
+    // Only the top `max_results` are ever shown, so avoid sorting millions of
+    // matches on every keystroke: partition around the cutoff (linear), then
+    // sort just that slice. A broad query used to spend hundreds of ms in a
+    // full sort — this is what made typing feel laggy.
+    let by_rank = |a: &(u32, u32), b: &(u32, u32)| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    if scored.len() > max_results {
+        scored.select_nth_unstable_by(max_results, by_rank);
+        scored.truncate(max_results);
+    }
+    scored.sort_unstable_by(by_rank);
 
     let hits: Vec<Hit> = scored
         .into_iter()
@@ -325,6 +334,37 @@ mod tests {
         assert_eq!(out.total, 1);
         assert_eq!(out.hits[0].name, "notes.txt");
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_top_results_correct_when_truncated() {
+        // The partial-sort path must still return the best-ranked hits, in
+        // order, when there are more matches than max_results.
+        let tmp = std::env::temp_dir().join(format!(
+            "find_trunc_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("dog.txt"), b"x").unwrap(); // best: exact stem
+        std::fs::write(tmp.join("dog run.txt"), b"x").unwrap(); // word at start
+        for i in 0..30 {
+            std::fs::write(tmp.join(format!("a_hotdog_{i}.txt")), b"x").unwrap();
+        }
+        let progress = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let index = crate::index::scan(&[tmp.clone()], &[], &progress, &cancel, &completed);
+
+        let spec = parse("dog", MatchMode::Substring, false);
+        let gen = AtomicU64::new(3);
+        let out = execute(&index, &spec, Category::All, 2, 3, &gen).unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert!(out.truncated);
+        assert_eq!(out.total, 32);
+        assert_eq!(out.hits[0].name, "dog.txt");
+        assert_eq!(out.hits[1].name, "dog run.txt");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

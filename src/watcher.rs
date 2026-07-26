@@ -23,11 +23,17 @@ impl Drop for WatchHandle {
 
 /// Watch `roots` and apply changes to `index`. Events are batched and applied
 /// every 500 ms to avoid write-lock churn during bursts (installs, builds...).
+/// `index_locked` is held true while a scan is streaming entries into the
+/// index. The scan assigns entry slots by position, so any insert from here
+/// during that window would shift those slots and corrupt parent pointers
+/// (paths would reconstruct as nonsense chains). Events are dropped while
+/// locked; the scan itself is producing the up-to-date state anyway.
 pub fn watch(
     roots: Vec<PathBuf>,
     exclusions: Vec<String>,
     index: Arc<RwLock<Index>>,
     dirty: Arc<AtomicBool>,
+    index_locked: Arc<AtomicBool>,
 ) -> Option<WatchHandle> {
     let (tx, rx) = crossbeam_channel::unbounded::<Event>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -81,6 +87,9 @@ pub fn watch(
                     continue;
                 }
                 let events = std::mem::take(&mut pending);
+                if index_locked.load(Ordering::Relaxed) {
+                    continue; // a scan owns the index; discard these events
+                }
                 if let Ok(mut idx) = index.write() {
                     for event in events {
                         apply_event(&mut idx, &event, &matcher);

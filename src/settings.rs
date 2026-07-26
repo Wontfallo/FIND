@@ -84,7 +84,9 @@ impl Default for Settings {
             exclusions: default_exclusions(),
             match_mode: MatchMode::Substring,
             case_sensitive: false,
-            max_results: 5_000,
+            // Only the top slice is ever displayed; each hit costs a path
+            // reconstruction, so keep this modest for snappy typing.
+            max_results: 1_000,
             show_preview: true,
             watch_filesystem: true,
             minimize_to_tray: true,

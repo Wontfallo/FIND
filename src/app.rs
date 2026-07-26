@@ -79,6 +79,8 @@ pub struct FindApp {
 
     /// Live copy of settings for background threads (scheduler).
     settings_shared: Arc<std::sync::Mutex<Settings>>,
+    /// True while a scan owns the index (blocks watcher writes).
+    index_locked: Arc<AtomicBool>,
     /// Roots whose scan finished (drives the checkmarks in Settings).
     completed_roots: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     /// Image URI to evict from egui's texture cache next frame.
@@ -229,6 +231,7 @@ impl FindApp {
         let completed_roots = Arc::new(std::sync::Mutex::new(
             std::collections::HashSet::new(),
         ));
+        let index_locked = Arc::new(AtomicBool::new(false));
 
         let (req_tx, req_rx) = crossbeam_channel::unbounded::<SearchRequest>();
         let (res_tx, res_rx) = crossbeam_channel::unbounded::<SearchResponse>();
@@ -249,6 +252,7 @@ impl FindApp {
             scan_cancel.clone(),
             dirty.clone(),
             completed_roots.clone(),
+            index_locked.clone(),
             cc.egui_ctx.clone(),
         );
         // Daily scheduled rescan (checks the configured HH:MM every 30s;
@@ -261,6 +265,7 @@ impl FindApp {
             scan_cancel.clone(),
             dirty.clone(),
             completed_roots.clone(),
+            index_locked.clone(),
             cc.egui_ctx.clone(),
         );
 
@@ -270,6 +275,7 @@ impl FindApp {
                 settings.exclusions.clone(),
                 index.clone(),
                 dirty.clone(),
+                index_locked.clone(),
             )
         } else {
             None
@@ -316,6 +322,7 @@ impl FindApp {
             show_settings: false,
             show_help: false,
             settings_shared,
+            index_locked,
             completed_roots,
             pending_forget: None,
             settings_roots_draft,
@@ -368,10 +375,12 @@ impl FindApp {
         let cancel = self.scan_cancel.clone();
         let dirty = self.dirty.clone();
         let completed = self.completed_roots.clone();
+        let locked = self.index_locked.clone();
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name("find-scan".into())
             .spawn(move || {
+                locked.store(true, Ordering::Relaxed);
                 let new_index = index::scan(
                     &settings.roots,
                     &settings.exclusions,
@@ -381,6 +390,7 @@ impl FindApp {
                 );
                 let _ = index::save_to_disk(&new_index);
                 *index.write().unwrap() = new_index;
+                locked.store(false, Ordering::Relaxed);
                 scanning.store(false, Ordering::SeqCst);
                 dirty.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
@@ -620,6 +630,7 @@ fn spawn_rescan_scheduler(
     cancel: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     completed: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    index_locked: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
     std::thread::Builder::new()
@@ -649,7 +660,9 @@ fn spawn_rescan_scheduler(
                     continue; // a scan is already running
                 }
                 cancel.store(false, Ordering::Relaxed);
+                index_locked.store(true, Ordering::Relaxed);
                 let new_index = index::scan(&roots, &exclusions, &progress, &cancel, &completed);
+                index_locked.store(false, Ordering::Relaxed);
                 if !cancel.load(Ordering::Relaxed) {
                     let _ = index::save_to_disk(&new_index);
                     if let Ok(mut guard) = index.write() {
@@ -673,6 +686,7 @@ fn spawn_initial_load(
     cancel: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     completed: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    index_locked: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
     std::thread::Builder::new()
@@ -682,6 +696,7 @@ fn spawn_initial_load(
             if scanning.swap(true, Ordering::SeqCst) {
                 return;
             }
+            index_locked.store(true, Ordering::Relaxed);
             match cached {
                 Some(loaded) => {
                     // Instant startup from the saved index. Only rescan if it
@@ -699,6 +714,7 @@ fn spawn_initial_load(
                         if let Ok(mut c) = completed.lock() {
                             c.extend(roots_covered);
                         }
+                        index_locked.store(false, Ordering::Relaxed);
                         scanning.store(false, Ordering::SeqCst);
                         dirty.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
@@ -733,6 +749,7 @@ fn spawn_initial_load(
                     }
                 }
             }
+            index_locked.store(false, Ordering::Relaxed);
             scanning.store(false, Ordering::SeqCst);
             dirty.store(true, Ordering::Relaxed);
             ctx.request_repaint();
