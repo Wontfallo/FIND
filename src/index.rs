@@ -174,7 +174,7 @@ impl Index {
     }
 }
 
-fn system_time_secs(t: Option<SystemTime>) -> i64 {
+pub fn system_time_secs(t: Option<SystemTime>) -> i64 {
     t.and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
@@ -416,18 +416,28 @@ pub fn save_to_disk(index: &Index) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let bytes = bincode::serialize(index)
+    let body = bincode::serialize(index)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut bytes = Vec::with_capacity(body.len() + 4);
+    bytes.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&body);
     let tmp = path.with_extension("bin.tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
+/// Bumped whenever the on-disk layout changes, so an old cache is discarded
+/// (and rebuilt) instead of failing to deserialize in confusing ways.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
 pub fn load_from_disk() -> Option<Index> {
     let path = cache_path()?;
     let bytes = std::fs::read(path).ok()?;
-    bincode::deserialize(&bytes).ok()
+    if bytes.len() < 4 || u32::from_le_bytes(bytes[..4].try_into().ok()?) != CACHE_FORMAT_VERSION {
+        return None;
+    }
+    bincode::deserialize(&bytes[4..]).ok()
 }
 
 #[cfg(test)]
@@ -471,6 +481,30 @@ mod tests {
         assert!(!hello.is_dir());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_cache_roundtrip_and_version_guard() {
+        // A versioned header must survive a save/load cycle, and a file with
+        // the wrong version must be rejected rather than misparsed.
+        let index = Index {
+            roots: vec![PathBuf::from("/tmp/x")],
+            scanned_at: 42,
+            ..Default::default()
+        };
+        let body = bincode::serialize(&index).unwrap();
+        let mut good = CACHE_FORMAT_VERSION.to_le_bytes().to_vec();
+        good.extend_from_slice(&body);
+        let parsed: Index = bincode::deserialize(&good[4..]).unwrap();
+        assert_eq!(parsed.scanned_at, 42);
+
+        let mut bad = (CACHE_FORMAT_VERSION + 1).to_le_bytes().to_vec();
+        bad.extend_from_slice(&body);
+        assert_ne!(
+            u32::from_le_bytes(bad[..4].try_into().unwrap()),
+            CACHE_FORMAT_VERSION,
+            "version guard must reject a newer cache format"
+        );
     }
 
     #[test]

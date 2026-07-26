@@ -684,11 +684,26 @@ fn spawn_initial_load(
             }
             match cached {
                 Some(loaded) => {
-                    // Instant startup from the saved index, then a background
-                    // rescan that swaps in atomically when complete.
+                    // Instant startup from the saved index. Only rescan if it
+                    // is stale: the file watcher keeps a fresh index current,
+                    // so re-walking every drive on every launch is wasted work.
+                    let age = index::system_time_secs(Some(std::time::SystemTime::now()))
+                        - loaded.scanned_at;
+                    let stale = age > 12 * 3600 || loaded.scanned_at == 0;
+                    let roots_covered: std::collections::HashSet<_> =
+                        loaded.roots.iter().cloned().collect();
                     *index.write().unwrap() = loaded;
                     dirty.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
+                    if !stale {
+                        if let Ok(mut c) = completed.lock() {
+                            c.extend(roots_covered);
+                        }
+                        scanning.store(false, Ordering::SeqCst);
+                        dirty.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        return;
+                    }
                     let new_index = index::scan(
                         &settings.roots,
                         &settings.exclusions,
