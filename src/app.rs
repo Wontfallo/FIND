@@ -462,8 +462,16 @@ impl FindApp {
         } else {
             ""
         };
+        let accent = theme_of(&self.settings).accent_light;
         if ui
-            .add(egui::Button::new(format!("{label}{arrow}")).frame(false))
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(format!("{label}{arrow}"))
+                        .color(accent)
+                        .strong(),
+                )
+                .frame(false),
+            )
             .clicked()
         {
             if self.sort == key {
@@ -953,18 +961,28 @@ impl FindApp {
         // Distinct toolbar tint with an accent edge, so the app's toolbar
         // reads clearly against the OS title bar above it.
         let t = theme_of(&self.settings);
+        // Blend the bar toward the accent so the toolbar is obviously the
+        // app's chrome and the OS title bar boundary is easy to see/grab.
+        let bar_fill = egui::Color32::from_rgb(
+            ((t.bar.r() as u16 * 3 + t.accent.r() as u16) / 4) as u8,
+            ((t.bar.g() as u16 * 3 + t.accent.g() as u16) / 4) as u8,
+            ((t.bar.b() as u16 * 3 + t.accent.b() as u16) / 4) as u8,
+        );
         let frame = egui::Frame::default()
-            .fill(t.bar)
+            .fill(bar_fill)
             .inner_margin(egui::Margin::symmetric(8, 4))
-            .stroke(egui::Stroke::new(1.0, t.accent.gamma_multiply(0.6)));
+            .stroke(egui::Stroke::new(2.0, t.accent));
         egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                // Reserve space for the right-hand controls first so the
+                // search box takes exactly what's left at any window size.
+                let controls_width = 300.0 * ctx.zoom_factor().max(1.0);
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search everything…  (try: report ext:pdf size:>1mb  or  content:\"todo\" ext:rs)")
+                        .hint_text("Search everything…")
                         .font(egui::FontId::proportional(19.0))
-                        .desired_width(ui.available_width() - 300.0),
+                        .desired_width((ui.available_width() - controls_width).max(120.0)),
                 );
                 if self.first_frame {
                     search.request_focus();
@@ -1016,11 +1034,24 @@ impl FindApp {
             });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 for cat in Category::ALL {
-                    if ui
-                        .selectable_label(self.category == cat, cat.label())
-                        .clicked()
-                    {
+                    let selected = self.category == cat;
+                    let (fill, text_color) = if selected {
+                        (t.accent, egui::Color32::WHITE)
+                    } else {
+                        (t.hover, ui.visuals().widgets.inactive.fg_stroke.color)
+                    };
+                    let button = egui::Button::new(
+                        egui::RichText::new(cat.label()).color(text_color),
+                    )
+                    .fill(fill)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if selected { t.accent_light } else { t.bar },
+                    ));
+                    if ui.add(button).clicked() {
                         self.category = cat;
                         self.send_search();
                     }
@@ -1204,6 +1235,9 @@ impl FindApp {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
+                // Recompute widths when the window resizes so columns grow
+                // with it instead of leaving an empty gap on the right.
+                .auto_shrink([false, false])
                 .sense(egui::Sense::click());
             if self.scroll_to_selected {
                 if let Some(sel) = self.selected {
@@ -1212,12 +1246,12 @@ impl FindApp {
                 self.scroll_to_selected = false;
             }
             let mut table = table
-                .column(Column::initial(320.0).at_least(120.0).clip(true))
+                .column(Column::auto().at_least(220.0).at_most(600.0).resizable(true).clip(true))
                 .column(Column::remainder().at_least(150.0).clip(true))
-                .column(Column::initial(90.0).at_least(60.0))
-                .column(Column::initial(130.0).at_least(90.0));
+                .column(Column::auto().at_least(80.0).resizable(true))
+                .column(Column::auto().at_least(120.0).resizable(true));
             if has_content {
-                table = table.column(Column::initial(260.0).at_least(100.0).clip(true));
+                table = table.column(Column::remainder().at_least(120.0).clip(true));
             }
 
             table
@@ -1370,7 +1404,10 @@ impl FindApp {
         let mut rescan = false;
         egui::Window::new("Settings")
             .open(&mut open)
-            .default_width(480.0)
+            .default_width(620.0)
+            .default_height(560.0)
+            .resizable(true)
+            .vscroll(true)
             .show(ctx, |ui| {
                 // --- Appearance ---
                 let mut theme_changed = false;
@@ -1574,8 +1611,15 @@ impl FindApp {
         let mut open = true;
         egui::Window::new("Search syntax")
             .open(&mut open)
-            .default_width(520.0)
+            .default_width(600.0)
+            .resizable(true)
+            .vscroll(true)
             .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Type anything to match file names.")
+                        .strong(),
+                );
+                ui.add_space(4.0);
                 ui.monospace(
                     "Plain words match file names (all words must match).\n\
                      \n\
