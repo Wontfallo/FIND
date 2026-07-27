@@ -1543,19 +1543,22 @@ impl FindApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Text size:");
-                    let mut scale = self.settings.ui_scale;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut scale, 0.8..=2.0)
-                                .step_by(0.05)
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
-                        self.settings.ui_scale = scale;
+                    // Stepped buttons, not a live slider: changing the zoom
+                    // rescales the UI, which would move a slider out from
+                    // under the cursor mid-drag.
+                    if ui.button("\u{f068}").on_hover_text("Smaller").clicked() {
+                        self.settings.ui_scale = (self.settings.ui_scale - 0.1).max(0.8);
                         theme_changed = true;
                     }
                     ui.label(format!("{:.0}%", self.settings.ui_scale * 100.0));
+                    if ui.button("\u{f067}").on_hover_text("Larger").clicked() {
+                        self.settings.ui_scale = (self.settings.ui_scale + 0.1).min(2.5);
+                        theme_changed = true;
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.settings.ui_scale = 1.0;
+                        theme_changed = true;
+                    }
                     ui.label(
                         egui::RichText::new("(or Ctrl+= / Ctrl+-)")
                             .small()
