@@ -1313,7 +1313,7 @@ impl FindApp {
             let mut table = TableBuilder::new(ui)
                 // New id: egui persists per-table column widths, so stale
                 // saved widths would keep overriding the layout below.
-                .id_salt("results_table_v2")
+                .id_salt("results_table_v3")
                 .striped(true)
                 .resizable(true)
                 // Recompute widths when the window resizes so columns grow
@@ -1334,6 +1334,8 @@ impl FindApp {
                 self.scroll_to_selected = false;
             }
             let mut table = table
+                // Row number: fixed, narrow, never resized away.
+                .column(Column::initial(64.0).at_least(44.0).clip(true))
                 .column(Column::initial(300.0).at_least(160.0).resizable(true).clip(true))
                 .column(Column::remainder().at_least(200.0).clip(true))
                 .column(Column::initial(90.0).at_least(70.0).resizable(true).clip(true));
@@ -1350,6 +1352,10 @@ impl FindApp {
 
             table
                 .header(26.0, |mut header| {
+                    header.col(|ui| {
+                        let accent = theme_of(&self.settings).accent_light;
+                        ui.label(egui::RichText::new("#").color(accent).strong());
+                    });
                     header.col(|ui| self.header_sort_button(ui, "Name", SortKey::Name));
                     header.col(|ui| self.header_sort_button(ui, "Path", SortKey::Path));
                     header.col(|ui| self.header_sort_button(ui, "Size", SortKey::Size));
@@ -1365,6 +1371,16 @@ impl FindApp {
                         let i = row.index();
                         let hit = &self.results[i];
                         row.set_selected(self.selected == Some(i));
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(thousands(i + 1))
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        });
                         row.col(|ui| {
                             let (icon, color) =
                                 if hit.is_dir { FOLDER_ICON } else { file_icon(&hit.name) };
