@@ -11,8 +11,67 @@ pub fn is_document(name: &str) -> bool {
         crate::util::extension_of(name)
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
-        Some("pdf" | "docx" | "pptx" | "xlsx" | "odt" | "odp" | "ods")
+        Some(
+            "pdf" | "docx" | "pptx" | "xlsx" | "xls" | "xlsm" | "odt" | "odp" | "ods"
+        )
     )
+}
+
+/// Render a spreadsheet's cells as an aligned text table, sheet by sheet.
+/// Used for both previews and `content:` search.
+fn extract_spreadsheet(path: &Path) -> Option<String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+    const MAX_ROWS: usize = 500;
+    const MAX_COLS: usize = 40;
+
+    let mut workbook = open_workbook_auto(path).ok()?;
+    let mut out = String::new();
+    for name in workbook.sheet_names().to_vec() {
+        let Ok(range) = workbook.worksheet_range(&name) else {
+            continue;
+        };
+        if range.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("── {name} ──\n"));
+        for (r, row) in range.rows().take(MAX_ROWS).enumerate() {
+            let cells: Vec<String> = row
+                .iter()
+                .take(MAX_COLS)
+                .map(|cell| match cell {
+                    Data::Empty => String::new(),
+                    Data::String(s) => s.replace(['\n', '\t'], " "),
+                    Data::Float(f) => {
+                        if f.fract() == 0.0 {
+                            format!("{}", *f as i64)
+                        } else {
+                            format!("{f}")
+                        }
+                    }
+                    Data::Int(i) => i.to_string(),
+                    Data::Bool(b) => b.to_string(),
+                    Data::DateTime(d) => d.to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            if cells.iter().all(|c| c.is_empty()) {
+                continue;
+            }
+            // Pad columns so the preview lines up like a grid.
+            let line: Vec<String> = cells
+                .iter()
+                .map(|c| format!("{:<14}", c.chars().take(14).collect::<String>()))
+                .collect();
+            out.push_str(line.join(" ").trim_end());
+            out.push('\n');
+            if r + 1 == MAX_ROWS {
+                out.push_str("… (truncated)\n");
+            }
+        }
+        out.push('\n');
+    }
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Extract readable text from a document. Returns None for unsupported or
@@ -26,10 +85,13 @@ pub fn extract_text(path: &Path) -> Option<String> {
         "pdf" => extract_pdf(path),
         "docx" => extract_zip_xml(path, ZipSelect::Exact("word/document.xml"), "</w:p>"),
         "pptx" => extract_zip_xml(path, ZipSelect::Prefix("ppt/slides/slide"), "</a:p>"),
-        "xlsx" => extract_zip_xml(path, ZipSelect::Exact("xl/sharedStrings.xml"), "</si>"),
-        "odt" | "odp" | "ods" => {
-            extract_zip_xml(path, ZipSelect::Exact("content.xml"), "</text:p>")
-        }
+        // Spreadsheets read as real cell grids (values, not just shared
+        // strings), falling back to raw XML strings if the parse fails.
+        "xlsx" | "xlsm" | "xls" => extract_spreadsheet(path)
+            .or_else(|| extract_zip_xml(path, ZipSelect::Exact("xl/sharedStrings.xml"), "</si>")),
+        "ods" => extract_spreadsheet(path)
+            .or_else(|| extract_zip_xml(path, ZipSelect::Exact("content.xml"), "</text:p>")),
+        "odt" | "odp" => extract_zip_xml(path, ZipSelect::Exact("content.xml"), "</text:p>"),
         _ => None,
     }
 }

@@ -39,7 +39,23 @@ pub fn load(hit: &Hit) -> PreviewContent {
             Err(_) => return info_for(hit),
         }
     }
-    // Documents (PDF, DOCX, PPTX, XLSX, ODF): preview their extracted text.
+    // Audio/video: container info (duration, resolution) plus file details.
+    if find_core::media::is_media(&hit.name) {
+        let info = find_core::media::probe(std::path::Path::new(&hit.path));
+        let mut text = String::new();
+        if !info.is_empty() {
+            text.push_str(&info.summary());
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!(
+            "{}\n\nSize: {}\nModified: {}\n\nDouble-click to play in your default player.",
+            hit.path,
+            human_size(hit.size),
+            human_date(hit.modified)
+        ));
+        return PreviewContent::Info(text);
+    }
+    // Documents (PDF, DOCX, PPTX, spreadsheets, ODF): preview extracted text.
     if find_core::doctext::is_document(&hit.name) && hit.size <= DOC_PREVIEW_MAX {
         if let Some(mut text) = find_core::doctext::extract_text(std::path::Path::new(&hit.path)) {
             let truncated = text.len() > TEXT_PREVIEW_BYTES;

@@ -6,6 +6,7 @@ pub mod doctext;
 pub mod index;
 #[cfg(target_os = "windows")]
 pub mod mft;
+pub mod media;
 pub mod query;
 pub mod search;
 pub mod settings;
