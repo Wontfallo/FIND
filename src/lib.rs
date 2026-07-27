@@ -10,5 +10,7 @@ pub mod media;
 pub mod query;
 pub mod search;
 pub mod settings;
+#[cfg(target_os = "windows")]
+pub mod thumbnail;
 pub mod util;
 pub mod watcher;

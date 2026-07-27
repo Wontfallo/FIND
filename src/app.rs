@@ -913,8 +913,46 @@ impl FindApp {
         if let Ok(handle) = frame.window_handle() {
             if let RawWindowHandle::Win32(win) = handle.as_raw() {
                 self.hwnd.store(win.hwnd.get(), Ordering::Relaxed);
+                self.apply_titlebar_colors();
             }
         }
+    }
+
+    /// Paint the OS title bar (caption, its text, and the window border) in
+    /// the app's accent colors. Windows draws that strip itself, so without
+    /// this it stays near-black and blends into the app. Windows 11 build
+    /// 22000+; older builds ignore the calls harmlessly.
+    #[cfg(target_os = "windows")]
+    fn apply_titlebar_colors(&self) {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        };
+        let handle = self.hwnd.load(Ordering::Relaxed);
+        if handle == 0 {
+            return;
+        }
+        let t = theme_of(&self.settings);
+        // Caption: the toolbar tint, so the window reads as one piece.
+        let caption = egui::Color32::from_rgb(
+            ((t.bar.r() as u16 * 3 + t.accent.r() as u16) / 4) as u8,
+            ((t.bar.g() as u16 * 3 + t.accent.g() as u16) / 4) as u8,
+            ((t.bar.b() as u16 * 3 + t.accent.b() as u16) / 4) as u8,
+        );
+        // COLORREF is 0x00BBGGRR, the reverse of the usual RGB order.
+        let colorref = |c: egui::Color32| -> u32 {
+            (c.b() as u32) << 16 | (c.g() as u32) << 8 | c.r() as u32
+        };
+        let set = |attr: u32, color: u32| unsafe {
+            DwmSetWindowAttribute(
+                handle as _,
+                attr,
+                &color as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+        };
+        set(DWMWA_CAPTION_COLOR as u32, colorref(caption));
+        set(DWMWA_TEXT_COLOR as u32, colorref(egui::Color32::from_rgb(240, 238, 234)));
+        set(DWMWA_BORDER_COLOR as u32, colorref(t.accent));
     }
 
     /// Tray events + close-to-tray behavior. No-op outside Windows.
@@ -1151,6 +1189,44 @@ impl FindApp {
                     PreviewContent::Empty => {}
                     PreviewContent::Info(text) => {
                         ui.label(text.as_str());
+                    }
+                    PreviewContent::Thumbnail {
+                        uri,
+                        width,
+                        height,
+                        rgba,
+                        caption,
+                    } => {
+                        // Upload once and reuse: the texture is keyed by uri
+                        // and dropped when the selection changes.
+                        let texture = ctx.tex_manager();
+                        let handle = ctx.load_texture(
+                            uri.clone(),
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [*width as usize, *height as usize],
+                                rgba,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        let _ = texture;
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            let available = ui.available_size();
+                            let scale = (available.x / *width as f32).min(1.0);
+                            ui.add(
+                                egui::Image::from_texture(&handle)
+                                    .fit_to_exact_size(egui::vec2(
+                                        *width as f32 * scale,
+                                        *height as f32 * scale,
+                                    ))
+                                    .corner_radius(4.0),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(caption.as_str())
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
                     }
                     PreviewContent::Image { uri, bytes } => {
                         egui::ScrollArea::both().show(ui, |ui| {
@@ -1458,6 +1534,8 @@ impl FindApp {
                 if theme_changed {
                     apply_theme(ctx, &self.settings);
                     ctx.set_zoom_factor(self.settings.ui_scale);
+                    #[cfg(target_os = "windows")]
+                    self.apply_titlebar_colors();
                     self.persist_settings();
                 }
                 ui.separator();

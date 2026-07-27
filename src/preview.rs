@@ -17,6 +17,14 @@ pub enum PreviewContent {
         uri: String,
         bytes: std::sync::Arc<[u8]>,
     },
+    /// Decoded pixels from the OS thumbnail provider (video frames etc).
+    Thumbnail {
+        uri: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        caption: String,
+    },
     Info(String),
 }
 
@@ -39,21 +47,34 @@ pub fn load(hit: &Hit) -> PreviewContent {
             Err(_) => return info_for(hit),
         }
     }
-    // Audio/video: container info (duration, resolution) plus file details.
+    // Audio/video: a real frame from the shell's thumbnail provider (the
+    // same one Explorer uses) plus duration/resolution read from the file.
     if find_core::media::is_media(&hit.name) {
         let info = find_core::media::probe(std::path::Path::new(&hit.path));
-        let mut text = String::new();
+        let mut caption = String::new();
         if !info.is_empty() {
-            text.push_str(&info.summary());
-            text.push_str("\n\n");
+            caption.push_str(&info.summary());
+            caption.push('\n');
         }
-        text.push_str(&format!(
-            "{}\n\nSize: {}\nModified: {}\n\nDouble-click to play in your default player.",
+        caption.push_str(&format!(
+            "{}\n{} • {}\n\nDouble-click to play in your default player.",
             hit.path,
             human_size(hit.size),
             human_date(hit.modified)
         ));
-        return PreviewContent::Info(text);
+        #[cfg(target_os = "windows")]
+        if let Some(thumb) =
+            find_core::thumbnail::shell_thumbnail(std::path::Path::new(&hit.path), 512)
+        {
+            return PreviewContent::Thumbnail {
+                uri: format!("thumb://{}", hit.path),
+                width: thumb.width,
+                height: thumb.height,
+                rgba: thumb.rgba,
+                caption,
+            };
+        }
+        return PreviewContent::Info(caption);
     }
     // Documents (PDF, DOCX, PPTX, spreadsheets, ODF): preview extracted text.
     if find_core::doctext::is_document(&hit.name) && hit.size <= DOC_PREVIEW_MAX {
@@ -86,6 +107,27 @@ pub fn load(hit: &Hit) -> PreviewContent {
 }
 
 fn info_for(hit: &Hit) -> PreviewContent {
+    // Last resort: the shell may still render this type (PSD, AI, 3D
+    // models, CAD, fonts...) via an installed thumbnail handler.
+    #[cfg(target_os = "windows")]
+    if !hit.is_dir && hit.size > 0 {
+        if let Some(thumb) =
+            find_core::thumbnail::shell_thumbnail(std::path::Path::new(&hit.path), 512)
+        {
+            return PreviewContent::Thumbnail {
+                uri: format!("thumb://{}", hit.path),
+                width: thumb.width,
+                height: thumb.height,
+                rgba: thumb.rgba,
+                caption: format!(
+                    "{}\n{} • {}",
+                    hit.path,
+                    human_size(hit.size),
+                    human_date(hit.modified)
+                ),
+            };
+        }
+    }
     PreviewContent::Info(format!(
         "{}\n\nSize: {}\nModified: {}\n\nNo preview available for this file type.",
         hit.path,
