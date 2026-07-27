@@ -1311,6 +1311,9 @@ impl FindApp {
             let has_content = self.results.iter().any(|h| h.content_line.is_some());
 
             let mut table = TableBuilder::new(ui)
+                // New id: egui persists per-table column widths, so stale
+                // saved widths would keep overriding the layout below.
+                .id_salt("results_table_v2")
                 .striped(true)
                 .resizable(true)
                 // Recompute widths when the window resizes so columns grow
@@ -1331,14 +1334,18 @@ impl FindApp {
                 self.scroll_to_selected = false;
             }
             let mut table = table
-                .column(Column::initial(280.0).at_least(160.0).resizable(true).clip(true))
-                .column(Column::remainder().at_least(150.0).clip(true))
-                .column(Column::initial(90.0).at_least(70.0).resizable(true).clip(true))
-                // Last column absorbs leftover width, so there is never a
-                // dead strip to the right of the table.
-                .column(Column::initial(150.0).at_least(120.0).clip(true));
+                .column(Column::initial(300.0).at_least(160.0).resizable(true).clip(true))
+                .column(Column::remainder().at_least(200.0).clip(true))
+                .column(Column::initial(90.0).at_least(70.0).resizable(true).clip(true));
             if has_content {
-                table = table.column(Column::remainder().at_least(120.0).clip(true));
+                table = table
+                    .column(Column::initial(160.0).at_least(120.0).resizable(true).clip(true))
+                    // Match column last: soaks up any leftover width.
+                    .column(Column::remainder().at_least(120.0).clip(true));
+            } else {
+                // No match column, so Modified is last and must stretch to
+                // the right edge — otherwise a dead strip appears there.
+                table = table.column(Column::remainder().at_least(150.0).clip(true));
             }
 
             table
@@ -1434,6 +1441,17 @@ impl FindApp {
                                 context_action = Some((i, RowAction::Reveal));
                                 ui.close();
                             }
+                            if ui
+                                .button("Search in This Folder")
+                                .on_hover_text(
+                                    "Adds path:<folder> to the query so results \
+                                     are limited to this folder and below",
+                                )
+                                .clicked()
+                            {
+                                context_action = Some((i, RowAction::SearchHere));
+                                ui.close();
+                            }
                             ui.separator();
                             if ui.button("Copy Path").clicked() {
                                 context_action = Some((i, RowAction::CopyPath));
@@ -1463,6 +1481,30 @@ impl FindApp {
                 match action {
                     RowAction::Open => self.open_hit(i),
                     RowAction::Reveal => self.reveal_hit(i),
+                    RowAction::SearchHere => {
+                        if let Some(h) = self.results.get(i) {
+                            // Folders scope to themselves; files to their parent.
+                            let folder = if h.is_dir {
+                                h.path.clone()
+                            } else {
+                                std::path::Path::new(&h.path)
+                                    .parent()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default()
+                            };
+                            // Replace any existing path: term, keep the rest.
+                            let rest: Vec<String> = self
+                                .query
+                                .split_whitespace()
+                                .filter(|t| !t.to_ascii_lowercase().starts_with("path:"))
+                                .map(String::from)
+                                .collect();
+                            self.query = format!("{} path:\"{}\"", rest.join(" "), folder)
+                                .trim()
+                                .to_string();
+                            self.send_search();
+                        }
+                    }
                     RowAction::CopyPath => {
                         if let Some(h) = self.results.get(i) {
                             ctx.copy_text(h.path.clone());
@@ -1739,6 +1781,10 @@ impl FindApp {
                      Filters (combine freely with words):\n\
                      ext:pdf,docx        only these extensions\n\
                      path:projects       full path must contain this\n\
+                     path:D:\\           search only the D: drive\n\
+                     path:\"C:\\My Docs\"  quote paths containing spaces\n\
+                                         (or right-click a row ->\n\
+                                          Search in This Folder)\n\
                      size:>10mb          also <, >=, <=, and 1mb..100mb\n\
                      date:>2024-01-01    modified after; also ranges a..b\n\
                      type:file           or type:folder\n\
@@ -1804,6 +1850,7 @@ impl FindApp {
 enum RowAction {
     Open,
     Reveal,
+    SearchHere,
     CopyPath,
     CopyName,
     CopyFolder,

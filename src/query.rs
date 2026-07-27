@@ -224,6 +224,18 @@ mod tests {
     }
 
     #[test]
+    fn test_quoted_path_with_spaces() {
+        // "Search in This Folder" emits path:"C:\\Some Folder\\Sub".
+        let spec = parse(
+            "report path:\"C:\\Users\\Me\\My Docs\"",
+            MatchMode::Substring,
+            false,
+        );
+        assert_eq!(spec.name_terms, vec!["report"]);
+        assert_eq!(spec.path_terms, vec!["C:\\Users\\Me\\My Docs"]);
+    }
+
+    #[test]
     fn test_case_preserved_in_terms() {
         let spec = parse("Path:MyDocs README", MatchMode::Substring, false);
         assert_eq!(spec.path_terms, vec!["MyDocs"]);
