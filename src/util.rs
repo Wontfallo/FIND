@@ -164,7 +164,10 @@ impl Category {
             ],
             Category::Video => &[
                 "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp",
-                "ts", "vob",
+                "vob", "mts", "m2ts",
+                // NB: ".ts" is deliberately absent — TypeScript sources vastly
+                // outnumber MPEG transport streams on a dev machine, and they
+                // are classified as Code below.
             ],
             Category::Archives => &[
                 "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "cab", "arj", "lz",

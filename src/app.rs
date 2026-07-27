@@ -854,11 +854,13 @@ impl eframe::App for FindApp {
 
         self.top_bar(ctx);
         self.status_bar(ctx, scanning);
+        // Side panels must be declared before the central panel claims the
+        // remaining space, or the drawer would overlap the results table.
+        self.settings_window(ctx);
         if self.settings.show_preview {
             self.preview_panel(ctx);
         }
         self.results_panel(ctx);
-        self.settings_window(ctx);
         self.help_window(ctx);
         self.handle_keys(ctx);
         self.first_frame = false;
@@ -1314,18 +1316,27 @@ impl FindApp {
                 // Recompute widths when the window resizes so columns grow
                 // with it instead of leaving an empty gap on the right.
                 .auto_shrink([false, false])
+                .vscroll(true)
+                .scroll_bar_visibility(
+                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                )
                 .sense(egui::Sense::click());
             if self.scroll_to_selected {
                 if let Some(sel) = self.selected {
-                    table = table.scroll_to_row(sel, None);
+                    // Center the row: passing None only scrolls far enough to
+                    // touch the edge, which loses the selection off-screen
+                    // when moving upward.
+                    table = table.scroll_to_row(sel, Some(egui::Align::Center));
                 }
                 self.scroll_to_selected = false;
             }
             let mut table = table
-                .column(Column::auto().at_least(220.0).at_most(600.0).resizable(true).clip(true))
+                .column(Column::initial(280.0).at_least(160.0).resizable(true).clip(true))
                 .column(Column::remainder().at_least(150.0).clip(true))
-                .column(Column::auto().at_least(80.0).resizable(true))
-                .column(Column::auto().at_least(120.0).resizable(true));
+                .column(Column::initial(90.0).at_least(70.0).resizable(true).clip(true))
+                // Last column absorbs leftover width, so there is never a
+                // dead strip to the right of the table.
+                .column(Column::initial(150.0).at_least(120.0).clip(true));
             if has_content {
                 table = table.column(Column::remainder().at_least(120.0).clip(true));
             }
@@ -1378,13 +1389,17 @@ impl FindApp {
                         row.col(|ui| {
                             if !hit.is_dir {
                                 ui.add(
-                                    egui::Label::new(human_size(hit.size)).selectable(false),
+                                    egui::Label::new(human_size(hit.size))
+                                        .truncate()
+                                        .selectable(false),
                                 );
                             }
                         });
                         row.col(|ui| {
                             ui.add(
-                                egui::Label::new(human_date(hit.modified)).selectable(false),
+                                egui::Label::new(human_date(hit.modified))
+                                    .truncate()
+                                    .selectable(false),
                             );
                         });
                         if has_content {
@@ -1478,13 +1493,29 @@ impl FindApp {
         }
         let mut open = true;
         let mut rescan = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .default_width(620.0)
-            .default_height(560.0)
+        // A docked drawer rather than a floating window: it belongs to the
+        // app, can't be dragged out of the way or lost behind it.
+        egui::SidePanel::left("settings_drawer")
             .resizable(true)
-            .vscroll(true)
+            .default_width(440.0)
+            .min_width(340.0)
+            .max_width(760.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme_of(&self.settings).bar)
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("\u{f00d} Close").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 // --- Appearance ---
                 let mut theme_changed = false;
                 ui.horizontal(|ui| {
@@ -1651,6 +1682,7 @@ impl FindApp {
                         self.apply_settings_draft();
                         rescan = true;
                     }
+                });
                 });
             });
         self.show_settings = open;
