@@ -3,6 +3,7 @@
 
 pub mod content;
 pub mod doctext;
+pub mod fileops;
 pub mod index;
 #[cfg(target_os = "windows")]
 pub mod mft;

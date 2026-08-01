@@ -85,6 +85,10 @@ pub struct FindApp {
     completed_roots: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     /// Image URI to evict from egui's texture cache next frame.
     pending_forget: Option<String>,
+    /// Paths awaiting delete confirmation.
+    pending_delete: Vec<String>,
+    /// Transient message shown in the status bar after an operation.
+    toast: Option<(String, Instant)>,
     show_settings: bool,
     show_help: bool,
     settings_roots_draft: String,
@@ -325,6 +329,8 @@ impl FindApp {
             index_locked,
             completed_roots,
             pending_forget: None,
+            pending_delete: Vec::new(),
+            toast: None,
             settings_roots_draft,
             settings_exclusions_draft,
             first_frame: true,
@@ -502,6 +508,86 @@ impl FindApp {
                     self.preview = preview::load(hit);
                 }
             }
+        }
+    }
+
+    /// Put the row's file on the clipboard (copy or cut).
+    fn clipboard_op(&mut self, row: usize, mode: find_core::fileops::ClipMode) {
+        let Some(hit) = self.results.get(row) else {
+            return;
+        };
+        let paths = vec![hit.path.clone()];
+        let verb = match mode {
+            find_core::fileops::ClipMode::Copy => "Copied",
+            find_core::fileops::ClipMode::Cut => "Cut",
+        };
+        let message = match find_core::fileops::clipboard_files(&paths, mode) {
+            Ok(()) => format!("{verb} {}", find_core::fileops::describe(&paths)),
+            Err(e) => format!("Could not {}: {e}", verb.to_lowercase()),
+        };
+        self.toast = Some((message, Instant::now()));
+    }
+
+    /// Modal confirmation before deleting; deletes go to the Recycle Bin.
+    fn delete_confirm_window(&mut self, ctx: &egui::Context) {
+        if self.pending_delete.is_empty() {
+            return;
+        }
+        let mut cancel = false;
+        let mut confirm = false;
+        let what = find_core::fileops::describe(&self.pending_delete);
+        egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            ui.heading("Delete?");
+            ui.add_space(6.0);
+            ui.label(format!("Move {what} to the Recycle Bin?"));
+            ui.add_space(4.0);
+            for path in self.pending_delete.iter().take(8) {
+                ui.label(
+                    egui::RichText::new(path)
+                        .monospace()
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(
+                        egui::RichText::new("Delete")
+                            .color(egui::Color32::from_rgb(240, 130, 120)),
+                    )
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.label(
+                    egui::RichText::new("Recoverable from the Recycle Bin")
+                        .small()
+                        .weak(),
+                );
+            });
+        });
+        if confirm {
+            let paths = std::mem::take(&mut self.pending_delete);
+            let message = match find_core::fileops::delete_to_recycle_bin(&paths) {
+                Ok(()) => {
+                    // Drop the deleted rows immediately; the watcher will
+                    // catch up with the index shortly.
+                    self.results.retain(|h| !paths.contains(&h.path));
+                    self.selected = None;
+                    self.preview = PreviewContent::Empty;
+                    self.preview_for = None;
+                    format!("Deleted {} to the Recycle Bin", find_core::fileops::describe(&paths))
+                }
+                Err(e) => format!("Delete failed: {e}"),
+            };
+            self.toast = Some((message, Instant::now()));
+        } else if cancel {
+            self.pending_delete.clear();
         }
     }
 
@@ -862,6 +948,7 @@ impl eframe::App for FindApp {
         }
         self.results_panel(ctx);
         self.help_window(ctx);
+        self.delete_confirm_window(ctx);
         self.handle_keys(ctx);
         self.first_frame = false;
     }
@@ -1123,6 +1210,23 @@ impl FindApp {
                         thousands(self.total),
                         self.search_ms
                     ));
+                }
+                // Result of the last file operation, for a few seconds.
+                if let Some((message, at)) = &self.toast {
+                    if at.elapsed().as_secs() < 6 {
+                        let message = message.clone();
+                        ui.separator();
+                        let color = if message.contains("failed") || message.contains("Could not")
+                        {
+                            egui::Color32::from_rgb(235, 130, 120)
+                        } else {
+                            theme_of(&self.settings).accent_light
+                        };
+                        ui.label(egui::RichText::new(message).color(color));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    } else {
+                        self.toast = None;
+                    }
                 }
                 if scanning {
                     ui.separator();
@@ -1481,6 +1585,34 @@ impl FindApp {
                                 context_action = Some((i, RowAction::CopyFolder));
                                 ui.close();
                             }
+                            ui.separator();
+                            if ui
+                                .button("Copy File")
+                                .on_hover_text("Copy the file itself, ready to paste in Explorer (Ctrl+C)")
+                                .clicked()
+                            {
+                                context_action = Some((i, RowAction::Copy));
+                                ui.close();
+                            }
+                            if ui
+                                .button("Cut File")
+                                .on_hover_text("Cut the file, ready to move by pasting in Explorer (Ctrl+X)")
+                                .clicked()
+                            {
+                                context_action = Some((i, RowAction::Cut));
+                                ui.close();
+                            }
+                            if ui
+                                .button(
+                                    egui::RichText::new("Delete")
+                                        .color(egui::Color32::from_rgb(230, 120, 110)),
+                                )
+                                .on_hover_text("Move to the Recycle Bin (Del)")
+                                .clicked()
+                            {
+                                context_action = Some((i, RowAction::Delete));
+                                ui.close();
+                            }
                         });
                     });
                 });
@@ -1529,6 +1661,13 @@ impl FindApp {
                     RowAction::CopyName => {
                         if let Some(h) = self.results.get(i) {
                             ctx.copy_text(h.name.clone());
+                        }
+                    }
+                    RowAction::Copy => self.clipboard_op(i, find_core::fileops::ClipMode::Copy),
+                    RowAction::Cut => self.clipboard_op(i, find_core::fileops::ClipMode::Cut),
+                    RowAction::Delete => {
+                        if let Some(h) = self.results.get(i) {
+                            self.pending_delete = vec![h.path.clone()];
                         }
                     }
                     RowAction::CopyFolder => {
@@ -1816,6 +1955,9 @@ impl FindApp {
                      ↑ / ↓      move selection\n\
                      Enter      open selected (or top) result\n\
                      Ctrl+Shift+C  copy full path\n\
+                     Ctrl+C     copy the file itself\n\
+                     Ctrl+X     cut the file\n\
+                     Del        delete to the Recycle Bin (asks first)\n\
                      Esc        clear search",
                 );
             });
@@ -1823,18 +1965,35 @@ impl FindApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.show_settings || self.show_help {
+        if self.show_settings || self.show_help || !self.pending_delete.is_empty() {
             return;
         }
-        let (down, up, enter, escape, copy_path) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
-                i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C),
-            )
-        });
+        let (down, up, enter, escape, copy_path, copy_file, cut_file, delete) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::Escape),
+                    i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C),
+                    i.modifiers.command && i.key_pressed(egui::Key::X),
+                    i.key_pressed(egui::Key::Delete),
+                )
+            });
+        if let Some(row) = self.selected {
+            if copy_file {
+                self.clipboard_op(row, find_core::fileops::ClipMode::Copy);
+            }
+            if cut_file {
+                self.clipboard_op(row, find_core::fileops::ClipMode::Cut);
+            }
+            if delete {
+                if let Some(h) = self.results.get(row) {
+                    self.pending_delete = vec![h.path.clone()];
+                }
+            }
+        }
         if down && !self.results.is_empty() {
             let next = self.selected.map(|s| (s + 1).min(self.results.len() - 1)).unwrap_or(0);
             self.select(next);
@@ -1867,6 +2026,9 @@ enum RowAction {
     Open,
     Reveal,
     SearchHere,
+    Copy,
+    Cut,
+    Delete,
     CopyPath,
     CopyName,
     CopyFolder,
