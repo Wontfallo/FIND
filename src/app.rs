@@ -403,7 +403,11 @@ impl FindApp {
                 // afterwards so sorting and size:/date: filters work.
                 Index::fill_metadata(&index, &progress, &cancel);
                 if let Ok(g) = index.read() {
-                    let _ = index::save_to_disk(&g);
+                    if let Err(e) = index::save_to_disk(&g) {
+                        // Silent failure here means a full rescan on every
+                        // launch, so make it visible.
+                        eprintln!("FIND: could not save index cache: {e}");
+                    }
                 }
                 dirty.store(true, Ordering::Relaxed);
                 ctx.request_repaint();

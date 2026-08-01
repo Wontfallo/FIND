@@ -38,11 +38,39 @@ pub struct Index {
     pub entries: Vec<Entry>,
     /// Full path -> entry index, for directories only. Used to resolve parents
     /// during scanning and to apply file-watcher events.
+    ///
+    /// Not serialized: `PathBuf` fails to serialize when a path is not valid
+    /// UTF-8 (legal on Windows), which made saving the whole index fail and
+    /// forced a full rescan on every launch. Both maps are derived from
+    /// `entries`, so they are rebuilt after loading instead.
+    #[serde(skip)]
     pub dir_map: HashMap<PathBuf, u32>,
     /// Children of each directory entry.
+    #[serde(skip)]
     pub children: HashMap<u32, Vec<u32>>,
+    /// Stored as strings for the same reason as above: a `PathBuf` that is
+    /// not valid UTF-8 aborts serialization of the entire index.
+    #[serde(with = "roots_as_strings")]
     pub roots: Vec<PathBuf>,
     pub scanned_at: i64,
+}
+
+mod roots_as_strings {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(roots: &[PathBuf], s: S) -> Result<S::Ok, S::Error> {
+        let strings: Vec<String> = roots
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        serde::Serialize::serialize(&strings, s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PathBuf>, D::Error> {
+        let strings: Vec<String> = Vec::deserialize(d)?;
+        Ok(strings.into_iter().map(PathBuf::from).collect())
+    }
 }
 
 impl Index {
@@ -85,6 +113,32 @@ impl Index {
             }
         }
         path
+    }
+
+    /// Reconstruct `children` and `dir_map` from `entries` (they are not
+    /// serialized). O(n) plus a path build per directory.
+    pub fn rebuild_derived(&mut self) {
+        self.children.clear();
+        self.dir_map.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.parent != NO_PARENT {
+                self.children
+                    .entry(entry.parent)
+                    .or_default()
+                    .push(i as u32);
+            }
+        }
+        let dirs: Vec<u32> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_dir() && !e.is_deleted())
+            .map(|(i, _)| i as u32)
+            .collect();
+        for idx in dirs {
+            let path = self.full_path(idx);
+            self.dir_map.insert(path, idx);
+        }
     }
 
     pub fn full_path_string(&self, idx: u32) -> String {
@@ -513,7 +567,7 @@ pub fn save_to_disk(index: &Index) -> std::io::Result<()> {
 
 /// Bumped whenever the on-disk layout changes, so an old cache is discarded
 /// (and rebuilt) instead of failing to deserialize in confusing ways.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 pub fn load_from_disk() -> Option<Index> {
     let path = cache_path()?;
@@ -521,7 +575,9 @@ pub fn load_from_disk() -> Option<Index> {
     if bytes.len() < 4 || u32::from_le_bytes(bytes[..4].try_into().ok()?) != CACHE_FORMAT_VERSION {
         return None;
     }
-    bincode::deserialize(&bytes[4..]).ok()
+    let mut index: Index = bincode::deserialize(&bytes[4..]).ok()?;
+    index.rebuild_derived();
+    Some(index)
 }
 
 #[cfg(test)]
@@ -584,6 +640,36 @@ mod tests {
         );
         // A well-formed entry still resolves fully.
         assert_eq!(index.full_path(file), PathBuf::from("C:\\").join("video.mp4"));
+    }
+
+    #[test]
+    fn test_cache_survives_non_utf8_names_and_rebuilds_maps() {
+        // Regression: dir_map was serialized as PathBuf keys, and serde
+        // refuses non-UTF-8 paths — one oddly named file made saving the
+        // whole index fail, so every launch rescanned from scratch.
+        let mut index = Index {
+            roots: vec![PathBuf::from("C:\\")],
+            scanned_at: 99,
+            ..Default::default()
+        };
+        let root = index.push_entry("C:\\", NO_PARENT, 0, 0, true);
+        let dir = index.push_entry("sub", root, 0, 0, true);
+        // A name with a lone surrogate, as produced by lossy conversion of
+        // an unpaired UTF-16 surrogate in a real Windows filename.
+        index.push_entry("odd\u{FFFD}name.txt", dir, 7, 0, false);
+        index.dir_map.insert(PathBuf::from("C:\\sub"), dir);
+
+        let bytes = bincode::serialize(&index).expect("index must serialize");
+        let mut restored: Index = bincode::deserialize(&bytes).unwrap();
+        assert!(restored.dir_map.is_empty(), "maps are not serialized");
+        restored.rebuild_derived();
+
+        assert_eq!(restored.entries.len(), 3);
+        assert_eq!(restored.roots, vec![PathBuf::from("C:\\")]);
+        // Derived maps came back.
+        assert_eq!(restored.dir_map.len(), 2);
+        assert!(restored.dir_map.contains_key(&PathBuf::from("C:\\").join("sub")));
+        assert_eq!(restored.children.get(&dir).map(Vec::len), Some(1));
     }
 
     #[test]
