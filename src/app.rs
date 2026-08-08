@@ -81,6 +81,10 @@ pub struct FindApp {
     settings_shared: Arc<std::sync::Mutex<Settings>>,
     /// True while a scan owns the index (blocks watcher writes).
     index_locked: Arc<AtomicBool>,
+    /// What happened with the on-disk cache this session (shown in Settings),
+    /// so a silent cache failure is visible instead of looking like a design
+    /// choice to rescan every launch.
+    cache_status: Arc<std::sync::Mutex<String>>,
     /// Roots whose scan finished (drives the checkmarks in Settings).
     completed_roots: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     /// Image URI to evict from egui's texture cache next frame.
@@ -236,6 +240,7 @@ impl FindApp {
             std::collections::HashSet::new(),
         ));
         let index_locked = Arc::new(AtomicBool::new(false));
+        let cache_status = Arc::new(std::sync::Mutex::new("checking…".to_string()));
 
         let (req_tx, req_rx) = crossbeam_channel::unbounded::<SearchRequest>();
         let (res_tx, res_rx) = crossbeam_channel::unbounded::<SearchResponse>();
@@ -257,6 +262,7 @@ impl FindApp {
             dirty.clone(),
             completed_roots.clone(),
             index_locked.clone(),
+            cache_status.clone(),
             cc.egui_ctx.clone(),
         );
         // Daily scheduled rescan (checks the configured HH:MM every 30s;
@@ -327,6 +333,7 @@ impl FindApp {
             show_help: false,
             settings_shared,
             index_locked,
+            cache_status,
             completed_roots,
             pending_forget: None,
             pending_delete: Vec::new(),
@@ -792,12 +799,38 @@ fn spawn_initial_load(
     dirty: Arc<AtomicBool>,
     completed: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     index_locked: Arc<AtomicBool>,
+    cache_status: Arc<std::sync::Mutex<String>>,
     ctx: egui::Context,
 ) {
+    let set_status = move |status: &Arc<std::sync::Mutex<String>>, text: String| {
+        if let Ok(mut s) = status.lock() {
+            *s = text;
+        }
+    };
     std::thread::Builder::new()
         .name("find-init".into())
         .spawn(move || {
-            let cached = index::load_from_disk().filter(|l| l.roots == settings.roots);
+            let raw = index::load_from_disk();
+            let cached = match raw {
+                None => {
+                    set_status(
+                        &cache_status,
+                        "no usable cache found — building a fresh index".into(),
+                    );
+                    None
+                }
+                Some(loaded) if loaded.roots != settings.roots => {
+                    set_status(
+                        &cache_status,
+                        format!(
+                            "cache was built for different locations ({:?}) — rebuilding",
+                            loaded.roots
+                        ),
+                    );
+                    None
+                }
+                Some(loaded) => Some(loaded),
+            };
             if scanning.swap(true, Ordering::SeqCst) {
                 return;
             }
@@ -810,6 +843,15 @@ fn spawn_initial_load(
                     let age = index::system_time_secs(Some(std::time::SystemTime::now()))
                         - loaded.scanned_at;
                     let stale = age > 12 * 3600 || loaded.scanned_at == 0;
+                    set_status(
+                        &cache_status,
+                        format!(
+                            "loaded {} entries from cache ({}h old){}",
+                            loaded.entries.len(),
+                            age / 3600,
+                            if stale { " — refreshing" } else { "" }
+                        ),
+                    );
                     let roots_covered: std::collections::HashSet<_> =
                         loaded.roots.iter().cloned().collect();
                     *index.write().unwrap() = loaded;
@@ -839,7 +881,16 @@ fn spawn_initial_load(
                         ctx.request_repaint();
                         Index::fill_metadata(&index, &progress, &cancel);
                         if let Ok(g) = index.read() {
-                            let _ = index::save_to_disk(&g);
+                            match index::save_to_disk(&g) {
+                                Ok(()) => set_status(
+                                    &cache_status,
+                                    format!("saved {} entries to cache", g.entries.len()),
+                                ),
+                                Err(e) => set_status(
+                                    &cache_status,
+                                    format!("CACHE SAVE FAILED: {e}"),
+                                ),
+                            }
                         }
                     }
                 }
@@ -856,7 +907,16 @@ fn spawn_initial_load(
                         &completed,
                     );
                     if !cancel.load(Ordering::Relaxed) {
-                        let _ = index::save_to_disk(&index.read().unwrap());
+                        let guard = index.read().unwrap();
+                        match index::save_to_disk(&guard) {
+                            Ok(()) => set_status(
+                                &cache_status,
+                                format!("saved {} entries to cache", guard.entries.len()),
+                            ),
+                            Err(e) => {
+                                set_status(&cache_status, format!("CACHE SAVE FAILED: {e}"))
+                            }
+                        }
                     }
                 }
             }
@@ -1774,6 +1834,36 @@ impl FindApp {
                     self.persist_settings();
                 }
                 ui.separator();
+
+                // Cache diagnostics: says plainly whether the saved index was
+                // used, rebuilt, or failed to save.
+                {
+                    let status = self
+                        .cache_status
+                        .lock()
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
+                    let failed = status.contains("FAILED");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Index cache:");
+                        ui.label(
+                            egui::RichText::new(status)
+                                .color(if failed {
+                                    egui::Color32::from_rgb(235, 130, 120)
+                                } else {
+                                    theme_of(&self.settings).accent_light
+                                }),
+                        );
+                    });
+                    if let Some(path) = find_core::index::cache_path() {
+                        ui.label(
+                            egui::RichText::new(path.display().to_string())
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    ui.separator();
+                }
 
                 ui.label("Indexed locations (one per line):");
                 // Per-root scan status, so you can see what's actually indexed.
