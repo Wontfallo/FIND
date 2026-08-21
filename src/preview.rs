@@ -11,6 +11,7 @@ const DOC_PREVIEW_MAX: u64 = 8 * 1024 * 1024;
 pub enum PreviewContent {
     Empty,
     Text { text: String, truncated: bool },
+    Markdown { text: String, truncated: bool },
     /// Image bytes loaded by us: the egui bytes-loader decodes them. (The
     /// file:// URI loader proved unreliable, so we read the file directly.)
     Image {
@@ -98,12 +99,22 @@ pub fn load(hit: &Hit) -> PreviewContent {
                     return info_for(hit);
                 }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
+                if is_markdown(&hit.name) {
+                    return PreviewContent::Markdown { text, truncated };
+                }
                 return PreviewContent::Text { text, truncated };
             }
             None => return info_for(hit),
         }
     }
     info_for(hit)
+}
+
+fn is_markdown(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
 fn info_for(hit: &Hit) -> PreviewContent {

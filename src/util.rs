@@ -214,7 +214,8 @@ pub fn is_texty(name: &str) -> bool {
             Category::Code.extensions().contains(&ext.as_str())
                 || matches!(
                     ext.as_str(),
-                    "txt" | "md" | "log" | "csv" | "tsv" | "cfg" | "conf" | "env" | "rst"
+                    "txt" | "md" | "markdown" | "log" | "csv" | "tsv" | "cfg" | "conf" | "env"
+                        | "rst"
                         | "properties" | "gitignore" | "editorconfig" | "dockerfile" | "makefile"
                         | "srt" | "sub" | "vtt" | "nfo" | "reg" | "inf" | "diff" | "patch"
                 )

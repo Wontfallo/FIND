@@ -76,6 +76,10 @@ pub struct FindApp {
 
     preview: PreviewContent,
     preview_for: Option<u32>,
+    /// Parse/image cache for rendered markdown previews.
+    markdown_cache: egui_commonmark::CommonMarkCache,
+    /// When true, show markdown previews as raw source instead of rendered.
+    markdown_raw: bool,
 
     /// Live copy of settings for background threads (scheduler).
     settings_shared: Arc<std::sync::Mutex<Settings>>,
@@ -329,6 +333,8 @@ impl FindApp {
             sort_descending: true,
             preview: PreviewContent::Empty,
             preview_for: None,
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            markdown_raw: false,
             show_settings: false,
             show_help: false,
             settings_shared,
@@ -1355,7 +1361,7 @@ impl FindApp {
                     );
                 }
                 ui.separator();
-                match &self.preview {
+                match &mut self.preview {
                     PreviewContent::Empty => {}
                     PreviewContent::Info(text) => {
                         ui.label(text.as_str());
@@ -1419,6 +1425,39 @@ impl FindApp {
                                 )
                                 .wrap(),
                             );
+                            if truncated {
+                                ui.label(
+                                    egui::RichText::new("… preview truncated")
+                                        .italics()
+                                        .weak(),
+                                );
+                            }
+                        });
+                    }
+                    PreviewContent::Markdown { text, truncated } => {
+                        let truncated = *truncated;
+                        let raw = &mut self.markdown_raw;
+                        let cache = &mut self.markdown_cache;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(raw, false, "Rendered");
+                            ui.selectable_value(raw, true, "Source");
+                        });
+                        ui.add_space(2.0);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if *raw {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text.as_str()).monospace().size(13.5),
+                                    )
+                                    .wrap(),
+                                );
+                            } else {
+                                egui_commonmark::CommonMarkViewer::new()
+                                    .max_image_width(Some(
+                                        ui.available_width().max(100.0) as usize
+                                    ))
+                                    .show(ui, cache, text);
+                            }
                             if truncated {
                                 ui.label(
                                     egui::RichText::new("… preview truncated")
