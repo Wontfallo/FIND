@@ -53,6 +53,15 @@ pub struct Index {
     #[serde(with = "roots_as_strings")]
     pub roots: Vec<PathBuf>,
     pub scanned_at: i64,
+    /// True only when every root has been fully scanned. A cache saved
+    /// mid-scan (checkpoint, quit) is loadable but NOT complete, and the
+    /// scan resumes instead of the app pretending the index is whole.
+    #[serde(default)]
+    pub complete: bool,
+    /// Roots (as strings) whose scan finished — lets an interrupted
+    /// multi-root build resume with only the missing roots.
+    #[serde(default)]
+    pub completed_roots: Vec<String>,
 }
 
 mod roots_as_strings {
@@ -293,6 +302,18 @@ impl Index {
         }
     }
 
+    /// Remove one root's subtree (used when resuming an interrupted build):
+    /// its entries are tombstoned and its dir_map keys dropped, so the root
+    /// can be re-streamed without duplicates.
+    pub fn purge_root(&mut self, root: &Path) {
+        if let Some(&idx) = self.dir_map.get(root) {
+            self.mark_deleted_recursive(idx);
+        }
+        self.dir_map.retain(|path, _| !path.starts_with(root));
+        let root_str = root.to_string_lossy().into_owned();
+        self.completed_roots.retain(|r| *r != root_str);
+    }
+
     fn mark_deleted_recursive(&mut self, idx: u32) {
         let mut stack = vec![idx];
         while let Some(i) = stack.pop() {
@@ -346,7 +367,19 @@ pub fn scan(
             if let Ok(mut c) = completed.lock() {
                 c.insert(root.clone());
             }
+            let root_str = root.to_string_lossy().into_owned();
+            if !index.completed_roots.contains(&root_str) {
+                index.completed_roots.push(root_str);
+            }
         }
+    }
+    if !cancel.load(Ordering::Relaxed)
+        && roots
+            .iter()
+            .all(|r| index.completed_roots.contains(&r.to_string_lossy().into_owned()))
+    {
+        index.complete = true;
+        index.scanned_at = system_time_secs(Some(SystemTime::now()));
     }
     index
 }
@@ -369,9 +402,120 @@ fn make_walker(root: &Path, exclusions: &[String]) -> Walker {
         })
 }
 
+/// Stream one root's tree into the live index in batches, with periodic
+/// cache checkpoints. The checkpointed cache is (correctly) incomplete —
+/// `complete` only becomes true in `finalize_live`.
+fn stream_root_live(
+    live: &std::sync::RwLock<Index>,
+    root: &Path,
+    exclusions: &[String],
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+    dirty: &AtomicBool,
+    last_save: &mut std::time::Instant,
+) {
+    const BATCH: usize = 65_536;
+    // Local mirrors let the walk assign final indices without holding the lock.
+    let mut dir_map_local: HashMap<PathBuf, u32> = HashMap::new();
+    let mut pending: Vec<Entry> = Vec::with_capacity(BATCH);
+    let mut pending_dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut base: u32 = live.read().map(|g| g.entries.len() as u32).unwrap_or(0);
+
+    for entry in make_walker(root, exclusions) {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let is_dir = entry.file_type().is_dir();
+        let (size, modified) = match &entry.client_state {
+            Some(meta) => (
+                if is_dir { 0 } else { meta.len() },
+                system_time_secs(meta.modified().ok()),
+            ),
+            None => (0, 0),
+        };
+        let parent_idx = if entry.depth() == 0 {
+            NO_PARENT
+        } else {
+            match dir_map_local.get(entry.parent_path()) {
+                Some(&i) => i,
+                None => continue,
+            }
+        };
+        let name = if entry.depth() == 0 {
+            path.to_string_lossy().into_owned()
+        } else {
+            entry.file_name().to_string_lossy().into_owned()
+        };
+
+        let idx = base + pending.len() as u32;
+        pending.push(Entry {
+            name: name.into(),
+            parent: parent_idx,
+            size,
+            modified,
+            flags: if is_dir { FLAG_DIR } else { 0 },
+        });
+        if is_dir {
+            dir_map_local.insert(path.clone(), idx);
+            pending_dirs.push((path, idx));
+        }
+        progress.fetch_add(1, Ordering::Relaxed);
+        if pending.len() >= BATCH {
+            flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+            // Checkpoint at most once a minute: serializing a huge index
+            // holds the read lock for seconds, which queues a writer and
+            // stalls everything behind it — keep that rare.
+            if last_save.elapsed().as_secs() >= 60 {
+                if let Ok(guard) = live.read() {
+                    let _ = save_to_disk(&guard);
+                }
+                *last_save = std::time::Instant::now();
+            }
+        }
+    }
+    flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+}
+
+/// After streaming, record a finished root both in the shared UI set and in
+/// the index itself (so an interrupted build knows where to resume).
+fn record_root_done(
+    live: &std::sync::RwLock<Index>,
+    completed: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    root: &Path,
+) {
+    if let Ok(mut c) = completed.lock() {
+        c.insert(root.to_path_buf());
+    }
+    if let Ok(mut guard) = live.write() {
+        let root_str = root.to_string_lossy().into_owned();
+        if !guard.completed_roots.contains(&root_str) {
+            guard.completed_roots.push(root_str);
+        }
+    }
+}
+
+/// Mark the index complete once every requested root finished.
+fn finalize_live(live: &std::sync::RwLock<Index>, roots: &[PathBuf], cancel: &AtomicBool) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut guard) = live.write() {
+        let all_done = roots
+            .iter()
+            .all(|r| guard.completed_roots.contains(&r.to_string_lossy().into_owned()));
+        if all_done {
+            guard.complete = true;
+            guard.scanned_at = system_time_secs(Some(SystemTime::now()));
+        }
+    }
+}
+
 /// First-run scan: streams entries into the shared `live` index in batches so
 /// the app is searchable immediately, with results growing as the scan runs.
-/// Only call when starting from scratch — it replaces whatever is in `live`.
+/// Replaces whatever is in `live`; use `scan_resume` to continue an
+/// interrupted build instead.
 pub fn scan_into(
     live: &std::sync::RwLock<Index>,
     roots: &[PathBuf],
@@ -384,7 +528,6 @@ pub fn scan_into(
     if let Ok(mut c) = completed.lock() {
         c.clear();
     }
-    const BATCH: usize = 65_536;
     {
         let mut guard = live.write().unwrap();
         *guard = Index {
@@ -395,78 +538,66 @@ pub fn scan_into(
     }
     progress.store(0, Ordering::Relaxed);
 
-    // Local mirrors let the walk assign final indices without holding the lock.
-    let mut dir_map_local: HashMap<PathBuf, u32> = HashMap::new();
-    let mut pending: Vec<Entry> = Vec::with_capacity(BATCH);
-    let mut pending_dirs: Vec<(PathBuf, u32)> = Vec::new();
-    let mut base: u32 = 0;
     let mut last_save = std::time::Instant::now();
-
     for root in roots {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        for entry in make_walker(root, exclusions) {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            let is_dir = entry.file_type().is_dir();
-            let (size, modified) = match &entry.client_state {
-                Some(meta) => (
-                    if is_dir { 0 } else { meta.len() },
-                    system_time_secs(meta.modified().ok()),
-                ),
-                None => (0, 0),
-            };
-            let parent_idx = if entry.depth() == 0 {
-                NO_PARENT
-            } else {
-                match dir_map_local.get(entry.parent_path()) {
-                    Some(&i) => i,
-                    None => continue,
-                }
-            };
-            let name = if entry.depth() == 0 {
-                path.to_string_lossy().into_owned()
-            } else {
-                entry.file_name().to_string_lossy().into_owned()
-            };
-
-            let idx = base + pending.len() as u32;
-            pending.push(Entry {
-                name: name.into(),
-                parent: parent_idx,
-                size,
-                modified,
-                flags: if is_dir { FLAG_DIR } else { 0 },
-            });
-            if is_dir {
-                dir_map_local.insert(path.clone(), idx);
-                pending_dirs.push((path, idx));
-            }
-            progress.fetch_add(1, Ordering::Relaxed);
-            if pending.len() >= BATCH {
-                flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
-                // Checkpoint at most once a minute: serializing a huge index
-                // holds the read lock for seconds, which queues a writer and
-                // stalls everything behind it — keep that rare.
-                if last_save.elapsed().as_secs() >= 60 {
-                    if let Ok(guard) = live.read() {
-                        let _ = save_to_disk(&guard);
-                    }
-                    last_save = std::time::Instant::now();
-                }
-            }
-        }
+        stream_root_live(live, root, exclusions, progress, cancel, dirty, &mut last_save);
         if !cancel.load(Ordering::Relaxed) {
-            if let Ok(mut c) = completed.lock() {
-                c.insert(root.clone());
-            }
+            record_root_done(live, completed, root);
         }
     }
-    flush_batch(live, &mut pending, &mut pending_dirs, &mut base, dirty);
+    finalize_live(live, roots, cancel);
+}
+
+/// Continue an interrupted index build: roots already marked complete are
+/// kept as-is; every other root is purged from the index and re-streamed.
+/// Nothing is thrown away, so each session makes real progress instead of
+/// restarting from zero.
+pub fn scan_resume(
+    live: &std::sync::RwLock<Index>,
+    roots: &[PathBuf],
+    exclusions: &[String],
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+    dirty: &AtomicBool,
+    completed: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+) {
+    // Seed the UI's per-root status from what the cache already finished.
+    let done: Vec<String> = live
+        .read()
+        .map(|g| g.completed_roots.clone())
+        .unwrap_or_default();
+    if let Ok(mut c) = completed.lock() {
+        c.clear();
+        c.extend(done.iter().map(PathBuf::from));
+    }
+    if let Ok(mut guard) = live.write() {
+        guard.roots = roots.to_vec();
+    }
+    progress.store(0, Ordering::Relaxed);
+
+    let mut last_save = std::time::Instant::now();
+    for root in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let root_str = root.to_string_lossy().into_owned();
+        if done.contains(&root_str) {
+            continue; // finished in an earlier session
+        }
+        // Drop whatever partial data a previous attempt left for this root,
+        // then stream it fresh.
+        if let Ok(mut guard) = live.write() {
+            guard.purge_root(root);
+        }
+        stream_root_live(live, root, exclusions, progress, cancel, dirty, &mut last_save);
+        if !cancel.load(Ordering::Relaxed) {
+            record_root_done(live, completed, root);
+        }
+    }
+    finalize_live(live, roots, cancel);
 }
 
 fn flush_batch(
@@ -541,6 +672,30 @@ fn scan_root(
     }
 }
 
+/// What the app should do at launch with a loaded cache. This tiny function
+/// IS the anti-reindex guarantee, so it lives here where tests can pin it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LaunchPlan {
+    /// Complete and young enough: no scanning of any kind.
+    UseAsIs,
+    /// Complete but older than the user's opt-in refresh threshold.
+    Refresh,
+    /// Saved mid-build: keep it and finish only the missing roots.
+    Resume,
+}
+
+pub fn launch_plan(complete: bool, scanned_at: i64, now: i64, auto_refresh_hours: u32) -> LaunchPlan {
+    if !complete {
+        return LaunchPlan::Resume;
+    }
+    let threshold = auto_refresh_hours as i64 * 3600;
+    if threshold > 0 && now - scanned_at > threshold {
+        LaunchPlan::Refresh
+    } else {
+        LaunchPlan::UseAsIs
+    }
+}
+
 /// Where the serialized index lives on disk.
 pub fn cache_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "find", "FIND")
@@ -551,6 +706,10 @@ pub fn save_to_disk(index: &Index) -> std::io::Result<()> {
     let Some(path) = cache_path() else {
         return Ok(());
     };
+    save_to_path(index, &path)
+}
+
+pub fn save_to_path(index: &Index, path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -567,10 +726,13 @@ pub fn save_to_disk(index: &Index) -> std::io::Result<()> {
 
 /// Bumped whenever the on-disk layout changes, so an old cache is discarded
 /// (and rebuilt) instead of failing to deserialize in confusing ways.
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 pub fn load_from_disk() -> Option<Index> {
-    let path = cache_path()?;
+    load_from_path(&cache_path()?)
+}
+
+pub fn load_from_path(path: &Path) -> Option<Index> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 4 || u32::from_le_bytes(bytes[..4].try_into().ok()?) != CACHE_FORMAT_VERSION {
         return None;
@@ -620,6 +782,157 @@ mod tests {
         assert_eq!(hello.size, 11);
         assert!(!hello.is_dir());
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The complete launch lifecycle, cold start to cold start, as it plays
+    /// out on disk. If this passes, the app cannot legally rescan at launch
+    /// once a build has completed.
+    #[test]
+    fn test_lifecycle_no_rescan_after_completed_build() {
+        let tmp = std::env::temp_dir().join(format!("find_life_{}", std::process::id()));
+        let root = tmp.join("data");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"bb").unwrap();
+        let cache = tmp.join("index.bin");
+
+        // Session 1: fresh streaming build completes and is saved.
+        let live = std::sync::RwLock::new(Index::default());
+        let progress = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        scan_into(&live, &[root.clone()], &[], &progress, &cancel, &dirty, &completed);
+        {
+            let g = live.read().unwrap();
+            assert!(g.complete, "finished build must be marked complete");
+            assert_eq!(g.completed_roots, vec![root.to_string_lossy().into_owned()]);
+            save_to_path(&g, &cache).unwrap();
+        }
+
+        // Session 2 (cold start): the cache loads complete, and the launch
+        // plan — with refresh disabled (default) — is UseAsIs: NO scan.
+        let loaded = load_from_path(&cache).expect("cache must load");
+        assert!(loaded.complete);
+        assert_eq!(loaded.live_count(), 4); // root, a.txt, sub, b.txt
+        let now = system_time_secs(Some(SystemTime::now()));
+        assert_eq!(
+            launch_plan(loaded.complete, loaded.scanned_at, now, 0),
+            LaunchPlan::UseAsIs
+        );
+        // Even a year later, refresh disabled means no scan at launch.
+        assert_eq!(
+            launch_plan(loaded.complete, loaded.scanned_at, now + 365 * 86_400, 0),
+            LaunchPlan::UseAsIs
+        );
+        // With an opt-in threshold, young caches still skip the scan...
+        assert_eq!(
+            launch_plan(loaded.complete, loaded.scanned_at, now, 24),
+            LaunchPlan::UseAsIs
+        );
+        // ...and only genuinely old ones refresh.
+        assert_eq!(
+            launch_plan(loaded.complete, loaded.scanned_at, now + 2 * 86_400, 24),
+            LaunchPlan::Refresh
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A build interrupted mid-way must resume (only the unfinished roots),
+    /// not restart, and must not duplicate the finished root's entries.
+    #[test]
+    fn test_lifecycle_interrupted_build_resumes_missing_roots() {
+        let tmp = std::env::temp_dir().join(format!("find_resume_{}", std::process::id()));
+        let root_a = tmp.join("done_root");
+        let root_b = tmp.join("pending_root");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("finished.txt"), b"x").unwrap();
+        std::fs::write(root_b.join("missing.txt"), b"y").unwrap();
+        let cache = tmp.join("index.bin");
+
+        // Session 1: only root A completes (as if the user quit during B).
+        let live = std::sync::RwLock::new(Index::default());
+        let progress = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        scan_into(&live, &[root_a.clone()], &[], &progress, &cancel, &dirty, &completed);
+        {
+            let mut g = live.write().unwrap();
+            // The interruption: B was requested but never finished. A quit
+            // mid-B saves exactly this shape via the checkpoint/quit paths.
+            g.roots = vec![root_a.clone(), root_b.clone()];
+            g.complete = false;
+            // Stale half-scanned junk from the aborted B pass:
+            let fake_b_root = g.push_entry_pub(&root_b.to_string_lossy(), NO_PARENT, 0, 0, true);
+            g.push_entry_pub("halfway.txt", fake_b_root, 1, 1, false);
+            g.dir_map.insert(root_b.clone(), fake_b_root);
+            save_to_path(&g, &cache).unwrap();
+        }
+
+        // Session 2: loads incomplete -> plan is Resume regardless of age.
+        let loaded = load_from_path(&cache).expect("cache must load");
+        assert!(!loaded.complete);
+        assert_eq!(
+            launch_plan(loaded.complete, loaded.scanned_at, i64::MAX / 2, 0),
+            LaunchPlan::Resume
+        );
+
+        let live = std::sync::RwLock::new(loaded);
+        let a_count_before = {
+            let g = live.read().unwrap();
+            g.entries
+                .iter()
+                .filter(|e| !e.is_deleted() && e.name.as_ref() == "finished.txt")
+                .count()
+        };
+        assert_eq!(a_count_before, 1);
+
+        let completed = std::sync::Mutex::new(std::collections::HashSet::new());
+        scan_resume(
+            &live,
+            &[root_a.clone(), root_b.clone()],
+            &[],
+            &progress,
+            &cancel,
+            &dirty,
+            &completed,
+        );
+        let g = live.read().unwrap();
+        assert!(g.complete, "resume finishing all roots must mark complete");
+        // A was NOT rescanned or duplicated.
+        assert_eq!(
+            g.entries
+                .iter()
+                .filter(|e| !e.is_deleted() && e.name.as_ref() == "finished.txt")
+                .count(),
+            1
+        );
+        // B's real file arrived; the stale junk from the aborted pass is gone.
+        assert_eq!(
+            g.entries
+                .iter()
+                .filter(|e| !e.is_deleted() && e.name.as_ref() == "missing.txt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.entries
+                .iter()
+                .filter(|e| !e.is_deleted() && e.name.as_ref() == "halfway.txt")
+                .count(),
+            0,
+            "stale partial entries must be purged on resume"
+        );
+        drop(g);
+        // And the completed state persists for session 3.
+        let g = live.read().unwrap();
+        save_to_path(&g, &cache).unwrap();
+        drop(g);
+        let reloaded = load_from_path(&cache).unwrap();
+        assert!(reloaded.complete);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

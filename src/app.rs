@@ -11,6 +11,7 @@ use find_core::search::{self, Hit};
 use find_core::settings::Settings;
 use find_core::util::{human_date, human_size, thousands, Category};
 use find_core::watcher::{self, WatchHandle};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -395,6 +396,7 @@ impl FindApp {
         let dirty = self.dirty.clone();
         let completed = self.completed_roots.clone();
         let locked = self.index_locked.clone();
+        let status = self.cache_status.clone();
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name("find-scan".into())
@@ -407,7 +409,22 @@ impl FindApp {
                     &cancel,
                     &completed,
                 );
-                *index.write().unwrap() = new_index;
+                // Only a COMPLETE scan may replace the index; a cancelled
+                // partial one would silently lose files.
+                if new_index.complete {
+                    *index.write().unwrap() = new_index;
+                    // Save immediately so the fresh timestamp survives even
+                    // if the app quits during the metadata pass.
+                    if let Ok(g) = index.read() {
+                        if let Err(e) = index::save_to_disk(&g) {
+                            if let Ok(mut st) = status.lock() {
+                                *st = format!("CACHE SAVE FAILED: {e}");
+                            }
+                        } else if let Ok(mut st) = status.lock() {
+                            *st = format!("rescan saved {} entries", g.entries.len());
+                        }
+                    }
+                }
                 locked.store(false, Ordering::Relaxed);
                 scanning.store(false, Ordering::SeqCst);
                 dirty.store(true, Ordering::Relaxed);
@@ -416,11 +433,7 @@ impl FindApp {
                 // afterwards so sorting and size:/date: filters work.
                 Index::fill_metadata(&index, &progress, &cancel);
                 if let Ok(g) = index.read() {
-                    if let Err(e) = index::save_to_disk(&g) {
-                        // Silent failure here means a full rescan on every
-                        // launch, so make it visible.
-                        eprintln!("FIND: could not save index cache: {e}");
-                    }
+                    let _ = index::save_to_disk(&g);
                 }
                 dirty.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
@@ -781,7 +794,7 @@ fn spawn_rescan_scheduler(
                 index_locked.store(true, Ordering::Relaxed);
                 let new_index = index::scan(&roots, &exclusions, &progress, &cancel, &completed);
                 index_locked.store(false, Ordering::Relaxed);
-                if !cancel.load(Ordering::Relaxed) {
+                if new_index.complete {
                     let _ = index::save_to_disk(&new_index);
                     if let Ok(mut guard) = index.write() {
                         *guard = new_index;
@@ -816,8 +829,26 @@ fn spawn_initial_load(
     std::thread::Builder::new()
         .name("find-init".into())
         .spawn(move || {
-            let raw = index::load_from_disk();
-            let cached = match raw {
+            // Helper: persist the live index and report the outcome.
+            let save_live = |index: &Arc<RwLock<Index>>,
+                             cache_status: &Arc<std::sync::Mutex<String>>,
+                             note: &str| {
+                if let Ok(guard) = index.read() {
+                    let text = match index::save_to_disk(&guard) {
+                        Ok(()) => format!(
+                            "{note}: saved {} entries (complete: {})",
+                            guard.entries.len(),
+                            guard.complete
+                        ),
+                        Err(e) => format!("CACHE SAVE FAILED: {e}"),
+                    };
+                    if let Ok(mut s) = cache_status.lock() {
+                        *s = text;
+                    }
+                }
+            };
+
+            let cached = match index::load_from_disk() {
                 None => {
                     set_status(
                         &cache_status,
@@ -841,38 +872,66 @@ fn spawn_initial_load(
                 return;
             }
             index_locked.store(true, Ordering::Relaxed);
-            match cached {
-                Some(loaded) => {
-                    // Instant startup from the saved index. Only rescan if it
-                    // is stale: the file watcher keeps a fresh index current,
-                    // so re-walking every drive on every launch is wasted work.
-                    let age = index::system_time_secs(Some(std::time::SystemTime::now()))
-                        - loaded.scanned_at;
-                    let stale = age > 12 * 3600 || loaded.scanned_at == 0;
-                    set_status(
-                        &cache_status,
-                        format!(
-                            "loaded {} entries from cache ({}h old){}",
-                            loaded.entries.len(),
-                            age / 3600,
-                            if stale { " — refreshing" } else { "" }
-                        ),
-                    );
-                    let roots_covered: std::collections::HashSet<_> =
-                        loaded.roots.iter().cloned().collect();
-                    *index.write().unwrap() = loaded;
-                    dirty.store(true, Ordering::Relaxed);
-                    ctx.request_repaint();
-                    if !stale {
-                        if let Ok(mut c) = completed.lock() {
-                            c.extend(roots_covered);
+
+        use find_core::index::LaunchPlan;
+            #[derive(Clone, Copy, PartialEq)]
+            enum Plan {
+                UseAsIs,
+                Refresh,
+                Resume,
+                /// Nothing usable: full streaming build.
+                Fresh,
+            }
+            let plan = match &cached {
+                None => Plan::Fresh,
+                Some(loaded) => match index::launch_plan(
+                    loaded.complete,
+                    loaded.scanned_at,
+                    index::system_time_secs(Some(std::time::SystemTime::now())),
+                    settings.auto_refresh_hours,
+                ) {
+                    LaunchPlan::UseAsIs => Plan::UseAsIs,
+                    LaunchPlan::Refresh => Plan::Refresh,
+                    LaunchPlan::Resume => Plan::Resume,
+                },
+            };
+
+            if let Some(loaded) = cached {
+                let age_h = (index::system_time_secs(Some(std::time::SystemTime::now()))
+                    - loaded.scanned_at)
+                    / 3600;
+                let n = loaded.entries.len();
+                let done_roots: Vec<PathBuf> =
+                    loaded.completed_roots.iter().map(PathBuf::from).collect();
+                *index.write().unwrap() = loaded;
+                if let Ok(mut c) = completed.lock() {
+                    c.clear();
+                    c.extend(done_roots);
+                }
+                dirty.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+                set_status(
+                    &cache_status,
+                    match plan {
+                        Plan::UseAsIs => {
+                            format!("loaded {n} entries from cache ({age_h}h old) — index complete, no scan needed")
                         }
-                        index_locked.store(false, Ordering::Relaxed);
-                        scanning.store(false, Ordering::SeqCst);
-                        dirty.store(true, Ordering::Relaxed);
-                        ctx.request_repaint();
-                        return;
-                    }
+                        Plan::Refresh => format!(
+                            "loaded {n} entries ({age_h}h old) — refreshing in background (Settings can turn this off)"
+                        ),
+                        Plan::Resume => format!(
+                            "loaded {n} entries from an interrupted build — finishing the remaining locations"
+                        ),
+                        Plan::Fresh => unreachable!(),
+                    },
+                );
+            }
+
+            match plan {
+                Plan::UseAsIs => {
+                    // The whole point: complete cache -> zero scanning.
+                }
+                Plan::Refresh => {
                     let new_index = index::scan(
                         &settings.roots,
                         &settings.exclusions,
@@ -880,49 +939,67 @@ fn spawn_initial_load(
                         &cancel,
                         &completed,
                     );
-                    if !cancel.load(Ordering::Relaxed) {
+                    if !cancel.load(Ordering::Relaxed) && new_index.complete {
                         *index.write().unwrap() = new_index;
-                        index_locked.store(false, Ordering::Relaxed);
+                        // Persist IMMEDIATELY: the refreshed timestamp must
+                        // hit disk even if the user quits during the
+                        // metadata pass below.
+                        save_live(&index, &cache_status, "refreshed");
                         dirty.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
+                        index_locked.store(false, Ordering::Relaxed);
                         Index::fill_metadata(&index, &progress, &cancel);
-                        if let Ok(g) = index.read() {
-                            match index::save_to_disk(&g) {
-                                Ok(()) => set_status(
-                                    &cache_status,
-                                    format!("saved {} entries to cache", g.entries.len()),
-                                ),
-                                Err(e) => set_status(
-                                    &cache_status,
-                                    format!("CACHE SAVE FAILED: {e}"),
-                                ),
-                            }
-                        }
+                        save_live(&index, &cache_status, "refreshed");
                     }
                 }
-                None => {
-                    // First run: stream the scan into the live index so search
-                    // works immediately, with results filling in as it goes.
-                    index::scan_into(
-                        &index,
-                        &settings.roots,
-                        &settings.exclusions,
-                        &progress,
-                        &cancel,
-                        &dirty,
-                        &completed,
-                    );
-                    if !cancel.load(Ordering::Relaxed) {
-                        let guard = index.read().unwrap();
-                        match index::save_to_disk(&guard) {
-                            Ok(()) => set_status(
-                                &cache_status,
-                                format!("saved {} entries to cache", guard.entries.len()),
-                            ),
-                            Err(e) => {
-                                set_status(&cache_status, format!("CACHE SAVE FAILED: {e}"))
-                            }
+                Plan::Resume | Plan::Fresh => {
+                    // With the NTFS fast path (admin), a full build takes
+                    // seconds — do it offline and swap. Otherwise stream the
+                    // directory walk so search works during the build and
+                    // checkpoints make interrupted builds resumable.
+                    #[cfg(target_os = "windows")]
+                    let fast = find_core::mft::can_use_fast_path();
+                    #[cfg(not(target_os = "windows"))]
+                    let fast = false;
+                    if fast {
+                        let new_index = index::scan(
+                            &settings.roots,
+                            &settings.exclusions,
+                            &progress,
+                            &cancel,
+                            &completed,
+                        );
+                        if new_index.complete {
+                            *index.write().unwrap() = new_index;
+                            save_live(&index, &cache_status, "built");
+                            dirty.store(true, Ordering::Relaxed);
+                            ctx.request_repaint();
+                            index_locked.store(false, Ordering::Relaxed);
+                            Index::fill_metadata(&index, &progress, &cancel);
+                            save_live(&index, &cache_status, "built");
                         }
+                    } else if plan == Plan::Resume {
+                        index::scan_resume(
+                            &index,
+                            &settings.roots,
+                            &settings.exclusions,
+                            &progress,
+                            &cancel,
+                            &dirty,
+                            &completed,
+                        );
+                        save_live(&index, &cache_status, "resumed build");
+                    } else {
+                        index::scan_into(
+                            &index,
+                            &settings.roots,
+                            &settings.exclusions,
+                            &progress,
+                            &cancel,
+                            &dirty,
+                            &completed,
+                        );
+                        save_live(&index, &cache_status, "initial build");
                     }
                 }
             }
@@ -1991,6 +2068,24 @@ impl FindApp {
                     &mut self.settings.minimize_to_tray,
                     "Keep running in the system tray when the window is closed",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Refresh index at launch if older than:");
+                    let mut hours = self.settings.auto_refresh_hours;
+                    ui.add(
+                        egui::DragValue::new(&mut hours)
+                            .range(0..=720)
+                            .speed(1)
+                            .suffix(" h"),
+                    );
+                    self.settings.auto_refresh_hours = hours;
+                    ui.label(
+                        egui::RichText::new(
+                            "0 = never (recommended: the live watcher keeps it current)",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
                 ui.horizontal(|ui| {
                     ui.label("Daily rescan at:");
                     ui.add(

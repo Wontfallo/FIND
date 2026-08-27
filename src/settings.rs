@@ -62,6 +62,12 @@ pub struct Settings {
     pub ui_scale: f32,
     /// "HH:MM" 24h local time for a daily automatic rescan; empty = off.
     pub auto_rescan_time: String,
+    /// Refresh a COMPLETE index in the background at launch when it is older
+    /// than this many hours. 0 (default) = never: the file watcher keeps the
+    /// index current while the app runs (including in the tray), and the
+    /// daily rescan / Rescan button cover the rest. This is what guarantees
+    /// the app does not reindex on every start.
+    pub auto_refresh_hours: u32,
     pub roots: Vec<PathBuf>,
     pub exclusions: Vec<String>,
     pub match_mode: MatchMode,
@@ -80,6 +86,7 @@ impl Default for Settings {
             accent: AccentColor::default(),
             ui_scale: 1.0,
             auto_rescan_time: String::new(),
+            auto_refresh_hours: 0,
             roots: default_roots(),
             exclusions: default_exclusions(),
             match_mode: MatchMode::Substring,

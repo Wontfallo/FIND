@@ -19,6 +19,8 @@ pub enum PreviewContent {
         bytes: std::sync::Arc<[u8]>,
     },
     /// Decoded pixels from the OS thumbnail provider (video frames etc).
+    /// Only constructed on Windows; other platforms render the other arms.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Thumbnail {
         uri: String,
         width: u32,
