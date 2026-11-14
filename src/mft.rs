@@ -1,167 +1,39 @@
-//! Fast NTFS enumeration (Windows only) — the trick that makes Everything
-//! index a whole drive in seconds.
+//! Fast NTFS indexing (Windows only) — Everything's approach.
 //!
-//! Instead of walking directories, this asks the volume for its entire file
-//! record table in bulk (`FSCTL_ENUM_USN_DATA`). Each record carries the
-//! file's name, its own reference number, and its parent's, which is enough
-//! to rebuild the whole tree. One sequential read of the volume metadata
-//! replaces millions of directory opens.
+//! Instead of walking directories, read the volume's file table in one pass
+//! (`volume::read_mft`), either directly when elevated or through the FIND
+//! service when not (`service.rs`). Every record carries its name, its parent's
+//! record number, size and timestamp, which is enough to build the whole tree
+//! with real metadata — no per-file `stat` afterwards.
 //!
-//! Requirements and fallbacks:
-//! - NTFS only, and opening a raw volume handle needs Administrator. When
-//!   either is missing, `enumerate_volume` returns None and the caller falls
-//!   back to the normal directory walk.
-//! - USN records carry no size or timestamp, so entries start with zeroed
-//!   metadata and are filled in afterwards by a background pass.
+//! Before reading, the USN journal position is recorded. Live updates resume
+//! from exactly there (`usn_watch.rs`), so changes made during or after the
+//! scan — even while FIND is closed — are replayed instead of rescanned.
 #![cfg(target_os = "windows")]
 
-use crate::index::{Index, NO_PARENT};
-use std::collections::HashMap;
+use crate::index::{Index, VolumeState, NO_PARENT};
+use crate::service;
+use crate::volume::{self, FileRecord, ROOT_RECORD};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-use windows_sys::Win32::System::Ioctl::{FSCTL_ENUM_USN_DATA, MFT_ENUM_DATA_V0};
-use windows_sys::Win32::System::IO::DeviceIoControl;
 
-/// The USN record layout we consume (V2). Declared locally: only these
-/// leading fields are needed, and the name follows at `file_name_offset`.
-#[repr(C)]
-struct UsnRecordV2 {
-    record_length: u32,
-    major_version: u16,
-    minor_version: u16,
-    file_reference_number: u64,
-    parent_file_reference_number: u64,
-    usn: i64,
-    time_stamp: i64,
-    reason: u32,
-    source_info: u32,
-    security_id: u32,
-    file_attributes: u32,
-    file_name_length: u16,
-    file_name_offset: u16,
-}
-
-struct VolumeHandle(HANDLE);
-
-impl Drop for VolumeHandle {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
+/// The drive letter when `root` is a whole drive (`C:\`), else None. Volume
+/// enumeration always covers the entire drive, so a narrower root (say
+/// `C:\Users`) must use the directory walk.
+pub fn drive_root_letter(root: &Path) -> Option<char> {
+    let s = root.to_string_lossy();
+    let mut chars = s.chars();
+    let letter = chars.next().filter(|c| c.is_ascii_alphabetic())?;
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(':'), Some('\\') | Some('/') | None, None) => Some(letter.to_ascii_uppercase()),
+        _ => None,
     }
 }
 
-fn open_volume(drive_letter: char) -> Option<VolumeHandle> {
-    let path: Vec<u16> = format!("\\\\.\\{drive_letter}:\0").encode_utf16().collect();
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            windows_sys::Win32::Foundation::GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        None
-    } else {
-        Some(VolumeHandle(handle))
-    }
-}
-
-/// One record pulled from the volume: name plus tree links.
-struct Record {
-    name: String,
-    parent_frn: u64,
-    is_dir: bool,
-}
-
-/// Read every file record on the volume. Returns None when the volume can't
-/// be opened (not NTFS, not elevated, removable media, etc.).
-fn read_records(
-    handle: &VolumeHandle,
-    progress: &AtomicUsize,
-    cancel: &AtomicBool,
-) -> Option<HashMap<u64, Record>> {
-    // 1 MiB at a time: fewer syscalls, and the driver fills it densely.
-    let mut buffer = vec![0u8; 1 << 20];
-    let mut input = MFT_ENUM_DATA_V0 {
-        StartFileReferenceNumber: 0,
-        LowUsn: 0,
-        HighUsn: i64::MAX,
-    };
-    let mut records: HashMap<u64, Record> = HashMap::with_capacity(1 << 16);
-
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        let mut bytes_returned: u32 = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                handle.0,
-                FSCTL_ENUM_USN_DATA,
-                &input as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<MFT_ENUM_DATA_V0>() as u32,
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                buffer.len() as u32,
-                &mut bytes_returned,
-                std::ptr::null_mut(),
-            )
-        };
-        // Failure on the first call means "can't enumerate" (wrong FS or no
-        // privilege); later it simply means we reached the end.
-        if ok == 0 {
-            return if records.is_empty() { None } else { Some(records) };
-        }
-        // The buffer starts with the next start reference number (8 bytes),
-        // followed by tightly packed USN records.
-        if bytes_returned <= 8 {
-            return Some(records);
-        }
-        input.StartFileReferenceNumber =
-            u64::from_le_bytes(buffer[..8].try_into().ok()?);
-
-        let mut offset = 8usize;
-        while offset + std::mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
-            let record = unsafe { &*(buffer.as_ptr().add(offset) as *const UsnRecordV2) };
-            let len = record.record_length as usize;
-            if len == 0 || offset + len > bytes_returned as usize {
-                break;
-            }
-            let name_start = offset + record.file_name_offset as usize;
-            let name_len = record.file_name_length as usize;
-            if name_start + name_len <= bytes_returned as usize {
-                let utf16: Vec<u16> = buffer[name_start..name_start + name_len]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                let name = String::from_utf16_lossy(&utf16);
-                records.insert(
-                    record.file_reference_number,
-                    Record {
-                        name,
-                        parent_frn: record.parent_file_reference_number,
-                        is_dir: record.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-                    },
-                );
-                progress.fetch_add(1, Ordering::Relaxed);
-            }
-            offset += len;
-        }
-    }
-}
-
-/// Reference number of an NTFS volume's root directory.
-const ROOT_FRN: u64 = 5;
-
-/// Build index entries for one volume, e.g. `C:\`. Entries are appended to
-/// `index`; sizes and timestamps are left at zero for the metadata pass.
-/// Returns false if the fast path is unavailable for this volume.
+/// Build index entries for one volume, e.g. `C:\`, and append them to `index`.
+/// Returns false when the fast path is unavailable for this root (not a whole
+/// drive, not NTFS, not elevated and no service): the caller walks instead.
 pub fn enumerate_volume(
     index: &mut Index,
     root: &Path,
@@ -169,81 +41,203 @@ pub fn enumerate_volume(
     progress: &AtomicUsize,
     cancel: &AtomicBool,
 ) -> bool {
-    let Some(letter) = root
-        .to_string_lossy()
-        .chars()
-        .next()
-        .filter(|c| c.is_ascii_alphabetic())
-    else {
+    let Some(letter) = drive_root_letter(root) else {
         return false;
     };
-    let Some(handle) = open_volume(letter) else {
+    // Journal position first: anything that changes while we read the MFT is
+    // then replayed by the watcher. Replays are idempotent.
+    let journal = service::query_journal(letter).ok();
+    let Ok((records, _full_metadata)) = service::enum_volume(letter, progress, cancel) else {
         return false;
     };
-    let Some(records) = read_records(&handle, progress, cancel) else {
+    if cancel.load(Ordering::Relaxed) {
         return false;
-    };
-
-    let matcher = crate::util::ExclusionMatcher::new(exclusions);
-    let root_path = PathBuf::from(format!("{letter}:\\"));
-    let root_idx = index.push_entry_pub(&root_path.to_string_lossy(), NO_PARENT, 0, 0, true);
-    index.dir_map.insert(root_path.clone(), root_idx);
-
-    // FRN -> index slot, filled as entries are created.
-    let mut slots: HashMap<u64, u32> = HashMap::with_capacity(records.len() + 1);
-    slots.insert(ROOT_FRN, root_idx);
-
-    // Resolve a record to a slot, creating ancestors first. Iterative to
-    // avoid deep recursion on long paths.
-    let mut stack: Vec<u64> = Vec::with_capacity(64);
-    for &frn in records.keys() {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
-        }
-        if slots.contains_key(&frn) {
-            continue;
-        }
-        stack.clear();
-        let mut cur = frn;
-        // Walk up to a known ancestor.
-        loop {
-            if slots.contains_key(&cur) {
-                break;
-            }
-            let Some(record) = records.get(&cur) else {
-                break; // orphan: parent record missing
-            };
-            stack.push(cur);
-            if stack.len() > 512 {
-                break; // pathological chain; give up on this branch
-            }
-            cur = record.parent_frn;
-        }
-        // Create entries from the highest unresolved ancestor downwards.
-        while let Some(frn) = stack.pop() {
-            let Some(record) = records.get(&frn) else {
-                continue;
-            };
-            let Some(&parent_slot) = slots.get(&record.parent_frn) else {
-                continue; // ancestor unresolved (orphan branch)
-            };
-            let parent_path = index.full_path(parent_slot);
-            let path = parent_path.join(&record.name);
-            if matcher.matches(&path) {
-                continue;
-            }
-            let slot =
-                index.push_entry_pub(&record.name, parent_slot, 0, 0, record.is_dir);
-            slots.insert(frn, slot);
-            if record.is_dir {
-                index.dir_map.insert(path, slot);
-            }
-        }
+    }
+    build_entries(index, letter, records, exclusions, cancel);
+    let root_str = format!("{letter}:\\");
+    index.volumes.retain(|v| v.root != root_str);
+    if let Some(j) = journal {
+        index.volumes.push(VolumeState {
+            root: root_str,
+            letter,
+            journal_id: j.journal_id,
+            next_usn: j.next_usn,
+        });
     }
     true
 }
 
-/// True when the process can open raw volume handles (i.e. is elevated).
+/// Turn flat records into tree entries. Directories are created parent-first;
+/// files then attach to their resolved directory.
+fn build_entries(
+    index: &mut Index,
+    letter: char,
+    records: Vec<FileRecord>,
+    exclusions: &[String],
+    cancel: &AtomicBool,
+) {
+    let matcher = crate::util::ExclusionMatcher::new(exclusions);
+    let root_path = PathBuf::from(format!("{letter}:\\"));
+    let root_idx = index.push_entry_pub(&root_path.to_string_lossy(), NO_PARENT, 0, 0, true);
+    index.dir_map.insert(root_path.clone(), root_idx);
+    index.dir_frns.insert(frn_key(letter, ROOT_RECORD), root_idx);
+
+    let mut dirs: HashMap<u64, usize> = HashMap::new();
+    let mut files: Vec<usize> = Vec::with_capacity(records.len());
+    for (i, r) in records.iter().enumerate() {
+        if r.is_dir {
+            // A directory has exactly one name (NTFS forbids directory hard
+            // links); keep the first seen.
+            dirs.entry(r.frn).or_insert(i);
+        } else {
+            files.push(i);
+        }
+    }
+
+    // Directory record number -> (slot, full path).
+    let mut slots: HashMap<u64, (u32, PathBuf)> = HashMap::with_capacity(dirs.len() + 1);
+    slots.insert(ROOT_RECORD, (root_idx, root_path));
+    let mut dead: HashSet<u64> = HashSet::new(); // excluded or orphaned
+    let mut stack: Vec<u64> = Vec::with_capacity(64);
+
+    let dir_frns: Vec<u64> = dirs.keys().copied().collect();
+    for frn in dir_frns {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        if slots.contains_key(&frn) || dead.contains(&frn) {
+            continue;
+        }
+        stack.clear();
+        let mut cur = frn;
+        // Walk up to a resolved (or dead) ancestor.
+        let mut ok = true;
+        loop {
+            if slots.contains_key(&cur) {
+                break;
+            }
+            if dead.contains(&cur) || stack.len() > 512 {
+                ok = false;
+                break;
+            }
+            let Some(&ri) = dirs.get(&cur) else {
+                ok = false; // parent record missing: orphan
+                break;
+            };
+            stack.push(cur);
+            cur = records[ri].parent;
+            if stack.contains(&cur) {
+                ok = false; // cycle: corrupt metadata
+                break;
+            }
+        }
+        if !ok {
+            dead.extend(stack.drain(..));
+            continue;
+        }
+        while let Some(d) = stack.pop() {
+            let r = &records[dirs[&d]];
+            let (parent_slot, parent_path) = match slots.get(&r.parent) {
+                Some((s, p)) => (*s, p.clone()),
+                None => {
+                    dead.insert(d);
+                    dead.extend(stack.drain(..));
+                    break;
+                }
+            };
+            let path = parent_path.join(&r.name);
+            if matcher.matches(&path) {
+                dead.insert(d);
+                dead.extend(stack.drain(..));
+                break;
+            }
+            let slot = index.push_entry_pub(&r.name, parent_slot, 0, r.modified, true);
+            index.dir_map.insert(path.clone(), slot);
+            index.dir_frns.insert(frn_key(letter, d), slot);
+            slots.insert(d, (slot, path));
+        }
+    }
+
+    for (n, i) in files.into_iter().enumerate() {
+        if n % 65_536 == 0 && cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let r = &records[i];
+        let Some((parent_slot, parent_path)) = slots.get(&r.parent) else {
+            continue;
+        };
+        if matcher.matches(&parent_path.join(&r.name)) {
+            continue;
+        }
+        index.push_entry_pub(&r.name, *parent_slot, r.size, r.modified, false);
+    }
+}
+
+/// `dir_frns` key: drive letter in the top byte, record number below. Record
+/// numbers are 48-bit, so the two never collide across volumes.
+pub fn frn_key(letter: char, record: u64) -> u64 {
+    ((letter.to_ascii_uppercase() as u64) << 56) | volume::record_number(record)
+}
+
+/// True when a whole-drive root can use the fast path right now.
 pub fn can_use_fast_path() -> bool {
-    open_volume('C').is_some()
+    service::access_for('C') != service::Access::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(frn: u64, parent: u64, name: &str, is_dir: bool, size: u64) -> FileRecord {
+        FileRecord {
+            frn,
+            parent,
+            name: name.into(),
+            is_dir,
+            size,
+            modified: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn drive_roots_only() {
+        assert_eq!(drive_root_letter(Path::new("C:\\")), Some('C'));
+        assert_eq!(drive_root_letter(Path::new("d:")), Some('D'));
+        assert_eq!(drive_root_letter(Path::new("C:\\Users")), None);
+        assert_eq!(drive_root_letter(Path::new("\\\\server\\share")), None);
+    }
+
+    #[test]
+    fn builds_tree_with_metadata_and_exclusions() {
+        // Records arrive in MFT order, children before parents included.
+        let records = vec![
+            rec(40, 30, "deep.txt", false, 12),
+            rec(30, 20, "inner", true, 0),
+            rec(20, ROOT_RECORD, "outer", true, 0),
+            rec(21, ROOT_RECORD, "top.bin", false, 99),
+            rec(50, ROOT_RECORD, "node_modules", true, 0),
+            rec(51, 50, "hidden.js", false, 1),
+            rec(60, 999, "orphan.txt", false, 1),
+        ];
+        let mut index = Index::default();
+        let cancel = AtomicBool::new(false);
+        build_entries(&mut index, 'C', records, &["node_modules".into()], &cancel);
+
+        let find = |name: &str| {
+            index
+                .entries
+                .iter()
+                .position(|e| e.name.as_ref() == name)
+                .map(|i| i as u32)
+        };
+        let deep = find("deep.txt").expect("nested file indexed");
+        assert_eq!(index.full_path(deep), PathBuf::from("C:\\outer\\inner\\deep.txt"));
+        assert_eq!(index.entries[deep as usize].size, 12);
+        assert_eq!(index.entries[deep as usize].modified, 1_700_000_000);
+        let top = find("top.bin").expect("top-level file indexed (root FRN fix)");
+        assert_eq!(index.full_path(top), PathBuf::from("C:\\top.bin"));
+        assert!(find("hidden.js").is_none(), "excluded folder's children skipped");
+        assert!(find("orphan.txt").is_none(), "orphans skipped");
+        assert!(index.dir_frns.contains_key(&frn_key('C', 30)));
+    }
 }

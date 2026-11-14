@@ -10,8 +10,14 @@ pub mod mft;
 pub mod media;
 pub mod query;
 pub mod search;
+#[cfg(target_os = "windows")]
+pub mod service;
 pub mod settings;
 #[cfg(target_os = "windows")]
 pub mod thumbnail;
+#[cfg(target_os = "windows")]
+pub mod usn_watch;
 pub mod util;
+#[cfg(target_os = "windows")]
+pub mod volume;
 pub mod watcher;

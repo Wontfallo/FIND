@@ -55,6 +55,21 @@ pub struct FindApp {
     scan_cancel: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     _watch: Option<WatchHandle>,
+    /// NTFS change-journal watcher (replaces `_watch` for whole drives that
+    /// have volume access, as Everything does).
+    #[cfg(target_os = "windows")]
+    _usn_watch: Option<find_core::usn_watch::UsnWatchHandle>,
+    /// Raised by the journal watcher when a journal was reset and the saved
+    /// position is gone: that volume must be rebuilt.
+    usn_rescan: Arc<AtomicBool>,
+    /// FIND service state for Settings, refreshed every few seconds.
+    #[cfg(target_os = "windows")]
+    service_status: Option<(find_core::service::Status, Instant)>,
+    /// Result of an in-flight install/uninstall (it waits on a UAC prompt).
+    #[cfg(target_os = "windows")]
+    service_job: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    #[cfg(target_os = "windows")]
+    service_msg: Option<String>,
 
     generation: Arc<AtomicU64>,
     req_tx: Sender<SearchRequest>,
@@ -284,9 +299,46 @@ impl FindApp {
             cc.egui_ctx.clone(),
         );
 
-        let watch = if settings.watch_filesystem {
+        // Whole NTFS drives with volume access (elevated, or the FIND
+        // service) get live updates from the change journal; everything else
+        // keeps the directory watcher.
+        let usn_rescan = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "windows")]
+        let journal_roots: Vec<PathBuf> = if settings.watch_filesystem {
+            settings
+                .roots
+                .iter()
+                .filter(|r| {
+                    find_core::mft::drive_root_letter(r).is_some_and(|l| {
+                        find_core::service::access_for(l) != find_core::service::Access::None
+                    })
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(target_os = "windows"))]
+        let journal_roots: Vec<PathBuf> = Vec::new();
+        #[cfg(target_os = "windows")]
+        let usn_watch = (!journal_roots.is_empty()).then(|| {
+            find_core::usn_watch::watch(
+                index.clone(),
+                settings.exclusions.clone(),
+                dirty.clone(),
+                index_locked.clone(),
+                usn_rescan.clone(),
+            )
+        });
+        let walk_roots: Vec<PathBuf> = settings
+            .roots
+            .iter()
+            .filter(|r| !journal_roots.contains(r))
+            .cloned()
+            .collect();
+        let watch = if settings.watch_filesystem && !walk_roots.is_empty() {
             watcher::watch(
-                settings.roots.clone(),
+                walk_roots,
                 settings.exclusions.clone(),
                 index.clone(),
                 dirty.clone(),
@@ -318,6 +370,15 @@ impl FindApp {
             scan_cancel,
             dirty,
             _watch: watch,
+            #[cfg(target_os = "windows")]
+            _usn_watch: usn_watch,
+            usn_rescan,
+            #[cfg(target_os = "windows")]
+            service_status: None,
+            #[cfg(target_os = "windows")]
+            service_job: None,
+            #[cfg(target_os = "windows")]
+            service_msg: None,
             generation,
             req_tx,
             res_rx,
@@ -1052,6 +1113,12 @@ impl eframe::App for FindApp {
         }
 
         let scanning = self.scanning.load(Ordering::Relaxed);
+
+        // A change journal was reset (wrapped or recreated) — its saved
+        // position is gone, so rebuild. With volume access that takes seconds.
+        if !scanning && self.usn_rescan.swap(false, Ordering::Relaxed) {
+            self.start_scan(ctx);
+        }
 
         // Watcher / scan progress: rerun the current query so new files show
         // up, but gently — every rerun replaces and re-sorts the visible
@@ -1981,6 +2048,12 @@ impl FindApp {
                     ui.separator();
                 }
 
+                #[cfg(target_os = "windows")]
+                {
+                    self.service_settings_ui(ui);
+                    ui.separator();
+                }
+
                 ui.label("Indexed locations (one per line):");
                 // Per-root scan status, so you can see what's actually indexed.
                 {
@@ -2117,6 +2190,98 @@ impl FindApp {
         if rescan {
             self.start_scan(ctx);
         }
+    }
+
+    /// "Fast NTFS indexing" section: service status plus install/remove.
+    #[cfg(target_os = "windows")]
+    fn service_settings_ui(&mut self, ui: &mut egui::Ui) {
+        use find_core::service::{self, Status};
+        // Finished install/uninstall?
+        if let Some(rx) = &self.service_job {
+            if let Ok(result) = rx.try_recv() {
+                self.service_msg = Some(match result {
+                    Ok(m) => m,
+                    Err(e) => format!("Failed: {e}"),
+                });
+                self.service_job = None;
+                self.service_status = None; // re-check now
+            }
+        }
+        let stale = self
+            .service_status
+            .is_none_or(|(_, t)| t.elapsed().as_secs() >= 3);
+        if stale {
+            self.service_status = Some((service::status(), Instant::now()));
+        }
+        let status = self.service_status.map(|(s, _)| s).unwrap_or(Status::NotRunning);
+        let elevated = find_core::volume::can_open_directly('C');
+
+        ui.label(egui::RichText::new("Fast NTFS indexing").strong());
+        let (text, color) = match (status, elevated) {
+            (Status::Running, _) => (
+                "FIND service running — whole drives index in seconds and stay current \
+                 from the NTFS change journal, without administrator rights.",
+                egui::Color32::from_rgb(120, 200, 130),
+            ),
+            (Status::Outdated, _) => (
+                "FIND service is from another version — click Install to update it.",
+                egui::Color32::from_rgb(220, 180, 90),
+            ),
+            (Status::NotRunning, true) => (
+                "Running as administrator — fast indexing works for this session only.",
+                egui::Color32::from_rgb(220, 180, 90),
+            ),
+            (Status::NotRunning, false) => (
+                "Not available: install the FIND service (one administrator prompt) to \
+                 index drives in seconds instead of walking every folder.",
+                egui::Color32::from_rgb(200, 120, 110),
+            ),
+        };
+        ui.label(egui::RichText::new(text).color(color));
+        ui.horizontal(|ui| {
+            let busy = self.service_job.is_some();
+            let install_label = if status == Status::NotRunning {
+                "Install service"
+            } else {
+                "Reinstall / update"
+            };
+            if ui
+                .add_enabled(!busy, egui::Button::new(install_label))
+                .on_hover_text(
+                    "Copies FIND to Program Files and registers a small Windows service \
+                     that reads the NTFS file table and change journal for FIND. \
+                     Like Everything's service, it lets signed-in users list file names \
+                     on local drives; it never reads file contents.",
+                )
+                .clicked()
+            {
+                self.spawn_service_job("--install-service", "Service installed. Click Save & Rescan for a fast rebuild; live updates start after restarting FIND.");
+            }
+            if status != Status::NotRunning
+                && ui
+                    .add_enabled(!busy, egui::Button::new("Remove service"))
+                    .clicked()
+            {
+                self.spawn_service_job("--uninstall-service", "Service removed.");
+            }
+            if busy {
+                ui.label(egui::RichText::new("waiting for the administrator prompt…").small().weak());
+            }
+        });
+        if let Some(msg) = &self.service_msg {
+            ui.label(egui::RichText::new(msg).small());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_service_job(&mut self, arg: &'static str, ok_msg: &'static str) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.service_job = Some(rx);
+        self.service_msg = None;
+        std::thread::spawn(move || {
+            let r = find_core::service::run_elevated(arg).map(|()| ok_msg.to_string());
+            let _ = tx.send(r);
+        });
     }
 
     fn apply_settings_draft(&mut self) {

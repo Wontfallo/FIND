@@ -62,6 +62,25 @@ pub struct Index {
     /// multi-root build resume with only the missing roots.
     #[serde(default)]
     pub completed_roots: Vec<String>,
+    /// NTFS drives indexed from the MFT, with the USN journal position the
+    /// index is current up to. Live updates resume from `next_usn` at launch,
+    /// so changes made while FIND was closed are replayed, not rescanned.
+    #[serde(default)]
+    pub volumes: Vec<VolumeState>,
+    /// Directory record number (see `mft::frn_key`) -> entry slot, for
+    /// directories that came from the MFT. Journal records name a parent by
+    /// record number, so this is how a change finds its folder.
+    #[serde(default)]
+    pub dir_frns: HashMap<u64, u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VolumeState {
+    /// The root this volume backs, e.g. `C:\`.
+    pub root: String,
+    pub letter: char,
+    pub journal_id: u64,
+    pub next_usn: i64,
 }
 
 mod roots_as_strings {
@@ -233,42 +252,47 @@ impl Index {
 
     /// Insert or refresh a single path (used by the file watcher).
     pub fn upsert_path(&mut self, path: &Path) {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return;
+        self.upsert_path_hint(path, None);
+    }
+
+    /// Insert or refresh a path, returning its slot. When the path can't be
+    /// stat'ed (e.g. another user's folder, readable to the FIND service but
+    /// not to us) and `is_dir_hint` is given, the entry is still recorded,
+    /// with zero size/date — the name is what search needs. This mirrors how
+    /// Everything lists files it learns about from the change journal.
+    pub fn upsert_path_hint(&mut self, path: &Path, is_dir_hint: Option<bool>) -> Option<u32> {
+        let (size, modified, is_dir) = match std::fs::symlink_metadata(path) {
+            Ok(meta) => (
+                if meta.is_dir() { 0 } else { meta.len() },
+                system_time_secs(meta.modified().ok()),
+                meta.is_dir(),
+            ),
+            Err(_) => (0, 0, is_dir_hint?),
         };
-        let modified = system_time_secs(meta.modified().ok());
-        let size = if meta.is_dir() { 0 } else { meta.len() };
-        let is_dir = meta.is_dir();
 
         // Existing directory: refresh in place.
         if let Some(&idx) = self.dir_map.get(path) {
             let e = &mut self.entries[idx as usize];
             e.modified = modified;
             e.flags &= !FLAG_DELETED;
-            return;
+            return Some(idx);
         }
 
-        let Some(parent_path) = path.parent() else {
-            return;
-        };
-        let Some(&parent_idx) = self.dir_map.get(parent_path) else {
-            // Parent isn't indexed (excluded or root not covered) — ignore.
-            return;
-        };
-        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-            return;
-        };
+        let parent_path = path.parent()?;
+        // Parent isn't indexed (excluded or root not covered) — ignore.
+        let parent_idx = *self.dir_map.get(parent_path)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned())?;
 
         // Existing file under this parent: refresh.
         if let Some(kids) = self.children.get(&parent_idx) {
             for &k in kids {
                 let e = &self.entries[k as usize];
-                if !e.is_dir() == !is_dir && e.name.as_ref() == name {
+                if e.is_dir() == is_dir && e.name.as_ref() == name {
                     let e = &mut self.entries[k as usize];
                     e.size = size;
                     e.modified = modified;
                     e.flags &= !FLAG_DELETED;
-                    return;
+                    return Some(k);
                 }
             }
         }
@@ -277,6 +301,61 @@ impl Index {
         if is_dir {
             self.dir_map.insert(path.to_path_buf(), idx);
         }
+        Some(idx)
+    }
+
+    /// Rename and/or move an entry in place. For a directory the whole
+    /// subtree follows (children point at it by slot); only the path-keyed
+    /// `dir_map` needs rewriting. Refuses moves into its own subtree.
+    pub fn move_entry(&mut self, idx: u32, new_parent: u32, new_name: &str) -> bool {
+        if idx as usize >= self.entries.len() || new_parent as usize >= self.entries.len() {
+            return false;
+        }
+        let mut cur = new_parent;
+        for _ in 0..1024 {
+            if cur == idx {
+                return false;
+            }
+            match self.entries[cur as usize].parent {
+                NO_PARENT => break,
+                p => cur = p,
+            }
+        }
+        let old_path = self.full_path(idx);
+        let old_parent = self.entries[idx as usize].parent;
+        if let Some(kids) = self.children.get_mut(&old_parent) {
+            kids.retain(|&c| c != idx);
+        }
+        {
+            let e = &mut self.entries[idx as usize];
+            e.name = new_name.into();
+            e.parent = new_parent;
+            e.flags &= !FLAG_DELETED;
+        }
+        self.children.entry(new_parent).or_default().push(idx);
+        if self.entries[idx as usize].is_dir() {
+            let new_path = self.full_path(idx);
+            let moved: Vec<(PathBuf, u32)> = self
+                .dir_map
+                .iter()
+                .filter(|(p, _)| p.starts_with(&old_path))
+                .map(|(p, &i)| (p.clone(), i))
+                .collect();
+            for (p, i) in moved {
+                self.dir_map.remove(&p);
+                if let Ok(rest) = p.strip_prefix(&old_path) {
+                    self.dir_map.insert(new_path.join(rest), i);
+                }
+            }
+        }
+        true
+    }
+
+    /// The slot of a live directory from the MFT, by journal record number.
+    pub fn dir_by_frn(&self, key: u64) -> Option<u32> {
+        let &slot = self.dir_frns.get(&key)?;
+        let e = self.entries.get(slot as usize)?;
+        (e.is_dir() && !e.is_deleted()).then_some(slot)
     }
 
     /// Mark a path (and any subtree) deleted (used by the file watcher).
@@ -312,6 +391,10 @@ impl Index {
         self.dir_map.retain(|path, _| !path.starts_with(root));
         let root_str = root.to_string_lossy().into_owned();
         self.completed_roots.retain(|r| *r != root_str);
+        self.volumes.retain(|v| v.root != root_str);
+        let entries = &self.entries;
+        self.dir_frns
+            .retain(|_, slot| entries.get(*slot as usize).is_some_and(|e| !e.is_deleted()));
     }
 
     fn mark_deleted_recursive(&mut self, idx: u32) {
@@ -726,7 +809,8 @@ pub fn save_to_path(index: &Index, path: &Path) -> std::io::Result<()> {
 
 /// Bumped whenever the on-disk layout changes, so an old cache is discarded
 /// (and rebuilt) instead of failing to deserialize in confusing ways.
-const CACHE_FORMAT_VERSION: u32 = 3;
+/// v4: volume journal positions and directory record numbers (USN updates).
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 pub fn load_from_disk() -> Option<Index> {
     load_from_path(&cache_path()?)
